@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"strings"
 	"testing"
 
@@ -75,7 +74,7 @@ func TestConvertChatCompletionsResponseToResponsesToolCall(t *testing.T) {
 		}]
 	}`)
 
-	converted := convertChatCompletionsResponseToResponses(context.Background(), req, resp)
+	converted := convertChatCompletionsResponseToResponses(req, resp)
 	if gjson.Get(converted, "output.0.name").String() != "exec_command" {
 		t.Fatalf("converted=%s", converted)
 	}
@@ -99,7 +98,7 @@ func TestConvertChatCompletionsResponseToResponsesIncludesReasoningAndRequestFie
 		"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}
 	}`)
 
-	converted := convertChatCompletionsResponseToResponses(context.Background(), req, resp)
+	converted := convertChatCompletionsResponseToResponses(req, resp)
 	if gjson.Get(converted, "instructions").String() != "be precise" {
 		t.Fatalf("converted=%s", converted)
 	}
@@ -119,7 +118,7 @@ func TestConvertChatCompletionsStreamToResponsesEmitsFunctionArgumentDelta(t *te
 	req := []byte(`{"model":"gpt-5-codex"}`)
 	chunk := []byte(`data: {"id":"chatcmpl_123","object":"chat.completion.chunk","created":123,"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}}]},"finish_reason":null}]}`)
 
-	events := convertChatCompletionsStreamToResponses(context.Background(), req, chunk, &state)
+	events := convertChatCompletionsStreamToResponses(req, chunk, &state)
 	joined := strings.Join(events, "\n")
 	if !strings.Contains(joined, "response.function_call_arguments.delta") {
 		t.Fatalf("events=%s", joined)
@@ -135,8 +134,8 @@ func TestConvertChatCompletionsStreamToResponsesKeepsMultipleToolCallsSeparate(t
 	chunk1 := []byte("data: {\"id\":\"chatcmpl_123\",\"object\":\"chat.completion.chunk\",\"created\":123,\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"cat README.md\\\"}\"}},{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"cat README_CN.md\\\"}\"}}]},\"finish_reason\":null}]}")
 	chunk2 := []byte("data: {\"id\":\"chatcmpl_123\",\"object\":\"chat.completion.chunk\",\"created\":123,\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}")
 
-	events1 := convertChatCompletionsStreamToResponses(context.Background(), req, chunk1, &state)
-	events2 := convertChatCompletionsStreamToResponses(context.Background(), req, chunk2, &state)
+	events1 := convertChatCompletionsStreamToResponses(req, chunk1, &state)
+	events2 := convertChatCompletionsStreamToResponses(req, chunk2, &state)
 	joined := strings.Join(append(events1, events2...), "\n")
 	if strings.Count(joined, "response.output_item.added") < 2 {
 		t.Fatalf("events=%s", joined)
@@ -152,8 +151,8 @@ func TestConvertChatCompletionsStreamToResponsesEmitsReasoningAndCompletedFields
 	chunk1 := []byte(`data: {"id":"chatcmpl_123","object":"chat.completion.chunk","created":123,"choices":[{"index":0,"delta":{"reasoning_content":"think ","content":"done"},"finish_reason":null}]}`)
 	chunk2 := []byte(`data: {"id":"chatcmpl_123","object":"chat.completion.chunk","created":123,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`)
 
-	events1 := convertChatCompletionsStreamToResponses(context.Background(), req, chunk1, &state)
-	events2 := convertChatCompletionsStreamToResponses(context.Background(), req, chunk2, &state)
+	events1 := convertChatCompletionsStreamToResponses(req, chunk1, &state)
+	events2 := convertChatCompletionsStreamToResponses(req, chunk2, &state)
 	joined := strings.Join(append(events1, events2...), "\n")
 	if !strings.Contains(joined, "response.reasoning_summary_text.delta") {
 		t.Fatalf("events=%s", joined)

@@ -79,7 +79,7 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize))
 	if err != nil {
 		writeClaudeError(w, http.StatusBadRequest, "invalid_request_error", "read body failed")
 		return
@@ -103,7 +103,7 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 	logPayloadSummary(reqID, "openai_request", openaiReq)
 
 	upstreamURL := strings.TrimSuffix(route.provider.BaseURL, "/") + "/chat/completions"
-	ctx, cancel := contextWithTimeout(r, 5*time.Minute)
+	ctx, cancel := contextWithTimeout(r, defaultUpstreamTimeout)
 	defer cancel()
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(openaiReq))
@@ -125,15 +125,15 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	if stream {
 		if resp.StatusCode != http.StatusOK {
-			respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+			respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRequestBodySize))
 			log.Printf("[%s] stream_error status=%d resp_bytes=%d total=%s", reqID, resp.StatusCode, len(respBody), sinceMS(startedAt))
 			writeClaudeError(w, resp.StatusCode, "api_error", string(respBody))
 			return
 		}
-		p.streamClaudeResponse(reqID, w, io.LimitReader(resp.Body, 10<<20), startedAt, upstreamStartedAt)
+		p.streamClaudeResponse(reqID, w, io.LimitReader(resp.Body, maxRequestBodySize), startedAt, upstreamStartedAt)
 	} else {
 		readStartedAt := time.Now()
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRequestBodySize))
 		log.Printf("[%s] upstream_body_read bytes=%d took=%s", reqID, len(respBody), sinceMS(readStartedAt))
 		logPayloadSummary(reqID, "openai_response", respBody)
 		if resp.StatusCode != http.StatusOK {
@@ -225,7 +225,7 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "read body failed")
 		return
@@ -248,7 +248,7 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[%s] responses_as_chat_completions_full body=%s", reqID, string(upstreamBody))
 
 	upstreamURL := strings.TrimSuffix(route.provider.BaseURL, "/") + "/chat/completions"
-	ctx, cancel := contextWithTimeout(r, 5*time.Minute)
+	ctx, cancel := contextWithTimeout(r, defaultUpstreamTimeout)
 	defer cancel()
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(upstreamBody))
@@ -274,7 +274,7 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	readStartedAt := time.Now()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRequestBodySize))
 	log.Printf("[%s] upstream_body_read bytes=%d took=%s", reqID, len(respBody), sinceMS(readStartedAt))
 	logChatCompletionsResponseSummary(reqID, "responses_upstream_response", respBody)
 	if resp.StatusCode != http.StatusOK {
@@ -284,7 +284,7 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	convertStartedAt := time.Now()
-	converted := convertChatCompletionsResponseToResponses(ctx, body, respBody)
+	converted := convertChatCompletionsResponseToResponses(body, respBody)
 	logResponsesSummary(reqID, "responses_converted_response", []byte(converted))
 	log.Printf("[%s] translated chat_completions->responses resp_bytes=%d took=%s total=%s", reqID, len(converted), sinceMS(convertStartedAt), sinceMS(startedAt))
 	w.Header().Set("Content-Type", "application/json")
@@ -301,7 +301,7 @@ func (p *Proxy) handleResponsesCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "read body failed")
 		return
@@ -328,7 +328,7 @@ func (p *Proxy) handleResponsesCompact(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[%s] responses_compact_as_chat_completions_full body=%s", reqID, string(upstreamBody))
 
 	upstreamURL := strings.TrimSuffix(route.provider.BaseURL, "/") + "/chat/completions"
-	ctx, cancel := contextWithTimeout(r, 5*time.Minute)
+	ctx, cancel := contextWithTimeout(r, defaultUpstreamTimeout)
 	defer cancel()
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(upstreamBody))
@@ -347,7 +347,7 @@ func (p *Proxy) handleResponsesCompact(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[%s] upstream_headers provider=%s status=%d took=%s", reqID, route.provider.Name, resp.StatusCode, sinceMS(startedAt))
 
 	readStartedAt := time.Now()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRequestBodySize))
 	log.Printf("[%s] upstream_body_read bytes=%d took=%s", reqID, len(respBody), sinceMS(readStartedAt))
 	logChatCompletionsResponseSummary(reqID, "responses_compact_upstream_response", respBody)
 	if resp.StatusCode != http.StatusOK {
@@ -357,7 +357,7 @@ func (p *Proxy) handleResponsesCompact(w http.ResponseWriter, r *http.Request) {
 	}
 
 	convertStartedAt := time.Now()
-	converted := convertChatCompletionsResponseToResponses(ctx, body, respBody)
+	converted := convertChatCompletionsResponseToResponses(body, respBody)
 	logResponsesSummary(reqID, "responses_compact_converted_response", []byte(converted))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -367,7 +367,7 @@ func (p *Proxy) handleResponsesCompact(w http.ResponseWriter, r *http.Request) {
 
 func (p *Proxy) streamResponsesFromChatCompletions(reqID string, w http.ResponseWriter, resp *http.Response, originalRequest []byte, requestStartedAt, upstreamStartedAt time.Time) {
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRequestBodySize))
 		log.Printf("[%s] responses_stream_error status=%d resp_bytes=%d total=%s summary=%s", reqID, resp.StatusCode, len(respBody), sinceMS(requestStartedAt), summarizeErrorBody(resp.Header.Get("Content-Type"), respBody))
 		writeOpenAIError(w, resp.StatusCode, string(respBody))
 		return
@@ -407,7 +407,7 @@ func (p *Proxy) streamResponsesFromChatCompletions(reqID string, w http.Response
 			log.Printf("[%s] responses_stream_first_upstream_data since_upstream=%s since_request=%s", reqID, sinceMS(upstreamStartedAt), sinceMS(requestStartedAt))
 		}
 		logStreamChunkSummary(reqID, "responses_upstream_chunk", data)
-		events := convertChatCompletionsStreamToResponses(context.Background(), originalRequest, append([]byte(nil), line...), &state)
+		events := convertChatCompletionsStreamToResponses(originalRequest, append([]byte(nil), line...), &state)
 		for _, event := range events {
 			eventCount++
 			if !firstDownstreamEventLogged {
@@ -435,7 +435,7 @@ func (p *Proxy) handleOpenAIPassthrough(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "read body failed")
 		return
@@ -457,7 +457,7 @@ func (p *Proxy) handleOpenAIPassthrough(w http.ResponseWriter, r *http.Request, 
 	}
 
 	upstreamURL := strings.TrimSuffix(route.provider.BaseURL, "/") + upstreamPath
-	ctx, cancel := contextWithTimeout(r, 5*time.Minute)
+	ctx, cancel := contextWithTimeout(r, defaultUpstreamTimeout)
 	defer cancel()
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(body))

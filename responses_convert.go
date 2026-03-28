@@ -2,14 +2,21 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+)
+
+const (
+	// maxRequestBodySize is the maximum size for request bodies (10MB)
+	maxRequestBodySize = 10 << 20
+	// defaultUpstreamTimeout is the default timeout for upstream requests
+	defaultUpstreamTimeout = 5 * time.Minute
 )
 
 func convertResponsesRequestToChatCompletions(modelName string, inputRawJSON []byte, stream bool) []byte {
@@ -268,7 +275,7 @@ func emitResponsesEvent(event, payload string) string {
 	return fmt.Sprintf("event: %s\ndata: %s", event, payload)
 }
 
-func convertChatCompletionsStreamToResponses(_ context.Context, requestRawJSON, rawJSON []byte, state *any) []string {
+func convertChatCompletionsStreamToResponses(requestRawJSON, rawJSON []byte, state *any) []string {
 	if *state == nil {
 		*state = &responsesStreamState{
 			ToolCalls:       make(map[string]*responsesToolCallState),
@@ -279,7 +286,11 @@ func convertChatCompletionsStreamToResponses(_ context.Context, requestRawJSON, 
 			Reasonings:      make([]responsesStateReasoning, 0),
 		}
 	}
-	st := (*state).(*responsesStreamState)
+	st, ok := (*state).(*responsesStreamState)
+	if !ok {
+		log.Printf("invalid state type in convertChatCompletionsStreamToResponses")
+		return nil
+	}
 
 	if bytes.HasPrefix(rawJSON, []byte("data:")) {
 		rawJSON = bytes.TrimSpace(rawJSON[5:])
@@ -631,7 +642,7 @@ func convertChatCompletionsStreamToResponses(_ context.Context, requestRawJSON, 
 	return out
 }
 
-func convertChatCompletionsResponseToResponses(_ context.Context, requestRawJSON, rawJSON []byte) string {
+func convertChatCompletionsResponseToResponses(requestRawJSON, rawJSON []byte) string {
 	root := gjson.ParseBytes(rawJSON)
 	resp := `{"id":"","object":"response","created_at":0,"status":"completed","background":false,"error":null,"incomplete_details":null}`
 
