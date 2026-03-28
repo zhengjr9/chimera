@@ -1,0 +1,17 @@
+# Chimera 配置示例文件
+# 复制此文件为 config.yaml 并填入您的实际配置
+
+server:
+  host: ""  # 监听地址，留空表示监听所有地址
+  port: 8080  # 监听端口
+  api-keys:  # 服务器 API 密钥列表
+    - "your-api-key-here"
+
+providers:
+  - name: "example-provider"  # 提供商名称
+    type: "openai-compatible"  # 提供商类型
+    base-url: "https://api.example.com/v1"  # API 基础 URL
+    api-key: "your-provider-api-key"  # 提供商 API 密钥
+    models:
+      - name: "model-name"  # 模型名称
+        alias: "model-alias"  # 模型别名
