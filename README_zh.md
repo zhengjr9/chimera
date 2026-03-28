@@ -1,6 +1,7 @@
 # Chimera - API 协议转换代理
 
-中文 | [English](README.md)
+中文 | [English](README.md) | [日本語](README_ja.md)
+
 
 Chimera 是一个轻量级的 API 代理服务器,可以在 Claude 和 OpenAI API 协议之间无缝转换。它允许您在任何兼容 OpenAI 的 API 提供商上使用 Claude Code 和其他 AI 编程工具。
 

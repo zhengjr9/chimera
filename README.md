@@ -1,6 +1,7 @@
 # Chimera - API Protocol Translation Proxy
 
-[中文文档](README_zh.md) | English
+[中文文档](README_zh.md) | [日本語](README_ja.md) | English
+
 
 Chimera is a lightweight API proxy server that seamlessly translates between Claude and OpenAI API protocols. It allows you to use Claude Code and other AI coding tools with any OpenAI-compatible API provider.
 
