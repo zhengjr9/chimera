@@ -16,6 +16,24 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+var passthroughRequestHeaders = []string{
+	"Accept",
+	"OpenAI-Beta",
+	"OpenAI-Organization",
+	"OpenAI-Project",
+	"User-Agent",
+	"X-Stainless-Arch",
+	"X-Stainless-Async",
+	"X-Stainless-Helper-Method",
+	"X-Stainless-Lang",
+	"X-Stainless-OS",
+	"X-Stainless-Package-Version",
+	"X-Stainless-Raw-Response",
+	"X-Stainless-Retry-Count",
+	"X-Stainless-Runtime",
+	"X-Stainless-Runtime-Version",
+}
+
 type routeEntry struct {
 	provider *ProviderConfig
 	model    string
@@ -39,8 +57,8 @@ func NewProxy(cfg *Config) *Proxy {
 		prov := &cfg.Providers[i]
 		for _, m := range prov.Models {
 			p.routes[m.Name] = routeEntry{provider: prov, model: m.Name}
-			if m.Alias != "" {
-				p.routes[m.Alias] = routeEntry{provider: prov, model: m.Name}
+			for _, alias := range modelAliases(m) {
+				p.routes[alias] = routeEntry{provider: prov, model: m.Name}
 			}
 		}
 	}
@@ -93,7 +111,7 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeClaudeError(w, http.StatusInternalServerError, "api_error", "create request failed")
 		return
 	}
-	p.setProviderHeaders(httpReq, route.provider)
+	p.setProviderHeaders(httpReq, route.provider, r.Header)
 
 	upstreamStartedAt := time.Now()
 	resp, err := p.client.Do(httpReq)
@@ -195,7 +213,12 @@ func (p *Proxy) streamClaudeResponse(reqID string, w http.ResponseWriter, body i
 
 // POST /v1/chat/completions — passthrough OpenAI protocol
 func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	reqID := nextRequestID("openai")
+	p.handleOpenAIPassthrough(w, r, "/chat/completions", "chat/completions", true)
+}
+
+// POST /v1/responses — passthrough OpenAI Responses protocol
+func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
+	reqID := nextRequestID("responses")
 	startedAt := time.Now()
 	if r.Method != http.MethodPost {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -211,7 +234,6 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	modelName := gjson.GetBytes(body, "model").String()
 	stream := gjson.GetBytes(body, "stream").Bool()
 	log.Printf("[%s] inbound method=%s path=%s model=%s stream=%t body_bytes=%d", reqID, r.Method, r.URL.Path, modelName, stream, len(body))
-	logPayloadSummary(reqID, "openai_passthrough_request", body)
 
 	route, ok := p.resolve(modelName)
 	if !ok {
@@ -219,7 +241,222 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	upstreamBody := convertResponsesRequestToChatCompletions(route.model, body, stream)
+	logPayloadSummary(reqID, "responses_request", body)
+	log.Printf("[%s] responses_request_full body=%s", reqID, string(body))
+	logPayloadSummary(reqID, "responses_as_chat_completions", upstreamBody)
+	log.Printf("[%s] responses_as_chat_completions_full body=%s", reqID, string(upstreamBody))
+
 	upstreamURL := strings.TrimSuffix(route.provider.BaseURL, "/") + "/chat/completions"
+	ctx, cancel := contextWithTimeout(r, 5*time.Minute)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(upstreamBody))
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "create request failed")
+		return
+	}
+	p.setProviderHeaders(httpReq, route.provider, r.Header)
+
+	upstreamStartedAt := time.Now()
+	resp, err := p.client.Do(httpReq)
+	if err != nil {
+		log.Printf("[%s] upstream_error provider=%s url=%s took=%s err=%v", reqID, route.provider.Name, upstreamURL, sinceMS(upstreamStartedAt), err)
+		writeOpenAIError(w, http.StatusBadGateway, "upstream: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	log.Printf("[%s] upstream_headers provider=%s status=%d took=%s", reqID, route.provider.Name, resp.StatusCode, sinceMS(upstreamStartedAt))
+
+	if stream {
+		p.streamResponsesFromChatCompletions(reqID, w, resp, body, startedAt, upstreamStartedAt)
+		return
+	}
+
+	readStartedAt := time.Now()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	log.Printf("[%s] upstream_body_read bytes=%d took=%s", reqID, len(respBody), sinceMS(readStartedAt))
+	logChatCompletionsResponseSummary(reqID, "responses_upstream_response", respBody)
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[%s] nonstream_error status=%d total=%s summary=%s", reqID, resp.StatusCode, sinceMS(startedAt), summarizeErrorBody(resp.Header.Get("Content-Type"), respBody))
+		writeOpenAIError(w, resp.StatusCode, string(respBody))
+		return
+	}
+
+	convertStartedAt := time.Now()
+	converted := convertChatCompletionsResponseToResponses(ctx, body, respBody)
+	logResponsesSummary(reqID, "responses_converted_response", []byte(converted))
+	log.Printf("[%s] translated chat_completions->responses resp_bytes=%d took=%s total=%s", reqID, len(converted), sinceMS(convertStartedAt), sinceMS(startedAt))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(converted))
+}
+
+// POST /v1/responses/compact — passthrough OpenAI compact responses protocol
+func (p *Proxy) handleResponsesCompact(w http.ResponseWriter, r *http.Request) {
+	reqID := nextRequestID("responses-compact")
+	startedAt := time.Now()
+	if r.Method != http.MethodPost {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "read body failed")
+		return
+	}
+
+	modelName := gjson.GetBytes(body, "model").String()
+	stream := gjson.GetBytes(body, "stream").Bool()
+	if stream {
+		writeOpenAIError(w, http.StatusBadRequest, "streaming not supported for this endpoint")
+		return
+	}
+	log.Printf("[%s] inbound method=%s path=%s model=%s stream=%t body_bytes=%d", reqID, r.Method, r.URL.Path, modelName, stream, len(body))
+
+	route, ok := p.resolve(modelName)
+	if !ok {
+		writeOpenAIError(w, http.StatusNotFound, fmt.Sprintf("model %q not found", modelName))
+		return
+	}
+
+	upstreamBody := convertResponsesRequestToChatCompletions(route.model, body, false)
+	logPayloadSummary(reqID, "responses_compact_request", body)
+	log.Printf("[%s] responses_compact_request_full body=%s", reqID, string(body))
+	logPayloadSummary(reqID, "responses_compact_as_chat_completions", upstreamBody)
+	log.Printf("[%s] responses_compact_as_chat_completions_full body=%s", reqID, string(upstreamBody))
+
+	upstreamURL := strings.TrimSuffix(route.provider.BaseURL, "/") + "/chat/completions"
+	ctx, cancel := contextWithTimeout(r, 5*time.Minute)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(upstreamBody))
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "create request failed")
+		return
+	}
+	p.setProviderHeaders(httpReq, route.provider, r.Header)
+
+	resp, err := p.client.Do(httpReq)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "upstream: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	log.Printf("[%s] upstream_headers provider=%s status=%d took=%s", reqID, route.provider.Name, resp.StatusCode, sinceMS(startedAt))
+
+	readStartedAt := time.Now()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	log.Printf("[%s] upstream_body_read bytes=%d took=%s", reqID, len(respBody), sinceMS(readStartedAt))
+	logChatCompletionsResponseSummary(reqID, "responses_compact_upstream_response", respBody)
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[%s] nonstream_error status=%d total=%s summary=%s", reqID, resp.StatusCode, sinceMS(startedAt), summarizeErrorBody(resp.Header.Get("Content-Type"), respBody))
+		writeOpenAIError(w, resp.StatusCode, string(respBody))
+		return
+	}
+
+	convertStartedAt := time.Now()
+	converted := convertChatCompletionsResponseToResponses(ctx, body, respBody)
+	logResponsesSummary(reqID, "responses_compact_converted_response", []byte(converted))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(converted))
+	log.Printf("[%s] translated chat_completions->responses_compact resp_bytes=%d took=%s total=%s", reqID, len(converted), sinceMS(convertStartedAt), sinceMS(startedAt))
+}
+
+func (p *Proxy) streamResponsesFromChatCompletions(reqID string, w http.ResponseWriter, resp *http.Response, originalRequest []byte, requestStartedAt, upstreamStartedAt time.Time) {
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+		log.Printf("[%s] responses_stream_error status=%d resp_bytes=%d total=%s summary=%s", reqID, resp.StatusCode, len(respBody), sinceMS(requestStartedAt), summarizeErrorBody(resp.Header.Get("Content-Type"), respBody))
+		writeOpenAIError(w, resp.StatusCode, string(respBody))
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeOpenAIError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	var state any
+	lineCount := 0
+	eventCount := 0
+	firstUpstreamDataLogged := false
+	firstDownstreamEventLogged := false
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		lineCount++
+		data := bytes.TrimSpace(line[5:])
+		if len(data) == 0 {
+			continue
+		}
+		if !firstUpstreamDataLogged {
+			firstUpstreamDataLogged = true
+			log.Printf("[%s] responses_stream_first_upstream_data since_upstream=%s since_request=%s", reqID, sinceMS(upstreamStartedAt), sinceMS(requestStartedAt))
+		}
+		logStreamChunkSummary(reqID, "responses_upstream_chunk", data)
+		events := convertChatCompletionsStreamToResponses(context.Background(), originalRequest, append([]byte(nil), line...), &state)
+		for _, event := range events {
+			eventCount++
+			if !firstDownstreamEventLogged {
+				firstDownstreamEventLogged = true
+				log.Printf("[%s] responses_stream_first_downstream_event since_upstream=%s since_request=%s", reqID, sinceMS(upstreamStartedAt), sinceMS(requestStartedAt))
+			}
+			logResponsesEventSummary(reqID, "responses_downstream_event", []byte(event))
+			_, _ = w.Write([]byte(event))
+			_, _ = w.Write([]byte("\n\n"))
+			flusher.Flush()
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("[%s] responses_stream_error upstream_lines=%d downstream_writes=%d total=%s err=%v", reqID, lineCount, eventCount, sinceMS(requestStartedAt), err)
+		return
+	}
+	log.Printf("[%s] responses_stream_done upstream_lines=%d downstream_writes=%d total=%s", reqID, lineCount, eventCount, sinceMS(requestStartedAt))
+}
+
+func (p *Proxy) handleOpenAIPassthrough(w http.ResponseWriter, r *http.Request, upstreamPath, logLabel string, allowStreaming bool) {
+	reqID := nextRequestID("openai")
+	startedAt := time.Now()
+	if r.Method != http.MethodPost {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "read body failed")
+		return
+	}
+
+	modelName := gjson.GetBytes(body, "model").String()
+	stream := gjson.GetBytes(body, "stream").Bool()
+	if stream && !allowStreaming {
+		writeOpenAIError(w, http.StatusBadRequest, "streaming not supported for this endpoint")
+		return
+	}
+	log.Printf("[%s] inbound method=%s path=%s model=%s stream=%t body_bytes=%d", reqID, r.Method, r.URL.Path, modelName, stream, len(body))
+	logPayloadSummary(reqID, "openai_passthrough_request "+logLabel, body)
+
+	route, ok := p.resolve(modelName)
+	if !ok {
+		writeOpenAIError(w, http.StatusNotFound, fmt.Sprintf("model %q not found", modelName))
+		return
+	}
+
+	upstreamURL := strings.TrimSuffix(route.provider.BaseURL, "/") + upstreamPath
 	ctx, cancel := contextWithTimeout(r, 5*time.Minute)
 	defer cancel()
 
@@ -228,7 +465,7 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusInternalServerError, "create request failed")
 		return
 	}
-	p.setProviderHeaders(httpReq, route.provider)
+	p.setProviderHeaders(httpReq, route.provider, r.Header)
 
 	upstreamStartedAt := time.Now()
 	resp, err := p.client.Do(httpReq)
@@ -270,9 +507,7 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	for _, prov := range p.cfg.Providers {
 		for _, m := range prov.Models {
 			names := []string{m.Name}
-			if m.Alias != "" {
-				names = append(names, m.Alias)
-			}
+			names = append(names, modelAliases(m)...)
 			for _, name := range names {
 				if seen[name] {
 					continue
@@ -295,11 +530,26 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func modelAliases(m ModelConfig) []string {
+	if len(m.Aliases) > 0 {
+		return m.Aliases
+	}
+	if m.Alias != "" {
+		return []string{m.Alias}
+	}
+	return nil
+}
+
 // -- helpers --
 
-func (p *Proxy) setProviderHeaders(req *http.Request, prov *ProviderConfig) {
+func (p *Proxy) setProviderHeaders(req *http.Request, prov *ProviderConfig, inbound http.Header) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+prov.APIKey)
+	for _, key := range passthroughRequestHeaders {
+		for _, value := range inbound.Values(key) {
+			req.Header.Add(key, value)
+		}
+	}
 	for k, v := range prov.Headers {
 		req.Header.Set(k, v)
 	}
@@ -415,6 +665,78 @@ func logStreamChunkSummary(reqID, label string, data []byte) {
 	if fr := root.Get("choices.0.finish_reason").String(); fr != "" {
 		log.Printf("[%s] %s finish_reason=%s", reqID, label, fr)
 	}
+}
+
+func logChatCompletionsResponseSummary(reqID, label string, body []byte) {
+	root := gjson.ParseBytes(body)
+	if id := root.Get("id").String(); id != "" {
+		log.Printf("[%s] %s id=%s", reqID, label, trimForLog(id))
+	}
+	if model := root.Get("model").String(); model != "" {
+		log.Printf("[%s] %s model=%s", reqID, label, model)
+	}
+	if tcs := root.Get("choices.0.message.tool_calls"); tcs.Exists() && tcs.IsArray() {
+		tcs.ForEach(func(_, tc gjson.Result) bool {
+			log.Printf("[%s] %s tool_call id=%s name=%s args=%s", reqID, label, trimForLog(tc.Get("id").String()), tc.Get("function.name").String(), trimForLog(tc.Get("function.arguments").String()))
+			return true
+		})
+	}
+	if content := root.Get("choices.0.message.content").String(); content != "" {
+		log.Printf("[%s] %s content=%s", reqID, label, trimForLog(content))
+	}
+	if fr := root.Get("choices.0.finish_reason").String(); fr != "" {
+		log.Printf("[%s] %s finish_reason=%s", reqID, label, fr)
+	}
+}
+
+func logResponsesSummary(reqID, label string, body []byte) {
+	root := gjson.ParseBytes(body)
+	if id := root.Get("id").String(); id != "" {
+		log.Printf("[%s] %s id=%s", reqID, label, trimForLog(id))
+	}
+	if model := root.Get("model").String(); model != "" {
+		log.Printf("[%s] %s model=%s", reqID, label, model)
+	}
+	if output := root.Get("output"); output.Exists() && output.IsArray() {
+		output.ForEach(func(_, item gjson.Result) bool {
+			switch item.Get("type").String() {
+			case "function_call":
+				log.Printf("[%s] %s function_call id=%s call_id=%s name=%s args=%s", reqID, label, trimForLog(item.Get("id").String()), trimForLog(item.Get("call_id").String()), item.Get("name").String(), trimForLog(item.Get("arguments").String()))
+			case "message":
+				log.Printf("[%s] %s message role=%s text=%s", reqID, label, item.Get("role").String(), trimForLog(item.Get("content.0.text").String()))
+			}
+			return true
+		})
+	}
+}
+
+func logResponsesEventSummary(reqID, label string, body []byte) {
+	eventLine := string(body)
+	if strings.HasPrefix(eventLine, "event: ") {
+		if newline := strings.IndexByte(eventLine, '\n'); newline >= 0 {
+			eventName := strings.TrimSpace(eventLine[len("event: "):newline])
+			log.Printf("[%s] %s type=%s", reqID, label, eventName)
+			if dataIndex := strings.Index(eventLine, "\ndata: "); dataIndex >= 0 {
+				logStreamChunkSummary(reqID, label+" "+eventName, []byte(eventLine[dataIndex+7:]))
+			}
+		}
+	}
+}
+
+func summarizeErrorBody(contentType string, body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	if strings.Contains(strings.ToLower(contentType), "application/json") || gjson.ValidBytes(body) {
+		if msg := firstNonEmpty(
+			gjson.GetBytes(body, "error.message").String(),
+			gjson.GetBytes(body, "message").String(),
+			gjson.GetBytes(body, "detail").String(),
+		); msg != "" {
+			return trimForLog(msg)
+		}
+	}
+	return trimForLog(string(body))
 }
 
 func trimForLog(s string) string {

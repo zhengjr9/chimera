@@ -8,6 +8,7 @@ Chimera 是一个轻量级的 API 代理服务器,可以在 Claude 和 OpenAI AP
 
 - **协议转换**: 自动在 Claude 和 OpenAI API 格式之间转换
 - **模型别名**: 支持模型名称别名,便于路由
+- **单模型多别名**: `alias` 同时支持字符串和字符串数组
 - **多提供商支持**: 配置多个 API 提供商和不同的模型
 - **流式响应支持**: 完整支持流式响应 (SSE)
 - **API 密钥认证**: 通过 API 密钥保护您的代理
@@ -44,6 +45,8 @@ providers:
     models:
       - name: "actual-model-name"  # 提供商上的真实模型名称
         alias: "alias-name"  # 模型的可选别名
+      - name: "another-model-name"
+        alias: ["alias-a", "alias-b"]  # 或多个别名
 ```
 
 完整示例请参见 `config.example.yaml`。

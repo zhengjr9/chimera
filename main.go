@@ -30,6 +30,8 @@ func main() {
 
 	mux.Handle("/v1/messages", auth(http.HandlerFunc(p.handleMessages)))
 	mux.Handle("/v1/chat/completions", auth(http.HandlerFunc(p.handleChatCompletions)))
+	mux.Handle("/v1/responses", auth(http.HandlerFunc(p.handleResponses)))
+	mux.Handle("/v1/responses/compact", auth(http.HandlerFunc(p.handleResponsesCompact)))
 	mux.Handle("/v1/models", auth(http.HandlerFunc(p.handleModels)))
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)

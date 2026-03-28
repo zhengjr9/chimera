@@ -141,6 +141,44 @@ providers:
 	}
 }
 
+func TestLoadConfigAliasArray(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	content := `
+server:
+  port: 8080
+providers:
+  - name: openai
+    type: openai
+    base-url: https://api.openai.com/v1
+    api-key: sk-test
+    models:
+      - name: gpt-5-codex
+        alias:
+          - codex
+          - gpt5-codex
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	model := cfg.Providers[0].Models[0]
+	if model.Alias != "codex" {
+		t.Fatalf("expected primary alias %q, got %q", "codex", model.Alias)
+	}
+	if len(model.Aliases) != 2 {
+		t.Fatalf("expected 2 aliases, got %d", len(model.Aliases))
+	}
+	if model.Aliases[0] != "codex" || model.Aliases[1] != "gpt5-codex" {
+		t.Fatalf("unexpected aliases: %#v", model.Aliases)
+	}
+}
+
 func TestLoadConfigFileNotFound(t *testing.T) {
 	_, err := LoadConfig("/nonexistent/config.yaml")
 	if err == nil {

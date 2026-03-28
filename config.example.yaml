@@ -15,3 +15,5 @@ providers:
     models:
       - name: "model-name"  # 模型名称
         alias: "model-alias"  # 模型别名
+      - name: "another-model-name"
+        alias: ["model-alias-a", "model-alias-b"]  # 多个模型别名

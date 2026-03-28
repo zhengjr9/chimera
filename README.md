@@ -8,6 +8,7 @@ Chimera is a lightweight API proxy server that seamlessly translates between Cla
 
 - **Protocol Translation**: Automatically translates between Claude and OpenAI API formats
 - **Model Aliasing**: Support for model name aliases for easy routing
+- **Multiple Aliases Per Model**: `alias` supports either a string or a string array
 - **Multiple Providers**: Configure multiple API providers with different models
 - **Streaming Support**: Full support for streaming responses (SSE)
 - **API Key Authentication**: Secure your proxy with API key authentication
@@ -44,6 +45,8 @@ providers:
     models:
       - name: "actual-model-name"  # Real model name on provider
         alias: "alias-name"  # Optional alias for the model
+      - name: "another-model-name"
+        alias: ["alias-a", "alias-b"]  # Or multiple aliases
 ```
 
 See `config.example.yaml` for a complete example.

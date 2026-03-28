@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -27,8 +28,51 @@ type ProviderConfig struct {
 }
 
 type ModelConfig struct {
-	Name  string `yaml:"name"`
-	Alias string `yaml:"alias"`
+	Name    string   `yaml:"name"`
+	Alias   string   `yaml:"-"`
+	Aliases []string `yaml:"-"`
+}
+
+func (m *ModelConfig) UnmarshalYAML(value *yaml.Node) error {
+	type rawModelConfig struct {
+		Name  string    `yaml:"name"`
+		Alias yaml.Node `yaml:"alias"`
+	}
+
+	var raw rawModelConfig
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+
+	m.Name = raw.Name
+	if raw.Alias.Kind == 0 {
+		return nil
+	}
+
+	switch raw.Alias.Kind {
+	case yaml.ScalarNode:
+		var alias string
+		if err := raw.Alias.Decode(&alias); err != nil {
+			return err
+		}
+		m.Alias = alias
+		if alias != "" {
+			m.Aliases = []string{alias}
+		}
+		return nil
+	case yaml.SequenceNode:
+		var aliases []string
+		if err := raw.Alias.Decode(&aliases); err != nil {
+			return err
+		}
+		m.Aliases = aliases
+		if len(aliases) > 0 {
+			m.Alias = aliases[0]
+		}
+		return nil
+	default:
+		return fmt.Errorf("alias must be a string or string array")
+	}
 }
 
 func LoadConfig(path string) (*Config, error) {
