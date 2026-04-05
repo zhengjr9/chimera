@@ -10,21 +10,40 @@ import (
 type Config struct {
 	Server    ServerConfig     `yaml:"server"`
 	Providers []ProviderConfig `yaml:"providers"`
+	Codex     CodexConfig      `yaml:"codex"`
+	Kiro      KiroConfig       `yaml:"kiro"`
 }
 
 type ServerConfig struct {
-	Host    string   `yaml:"host"`
-	Port    int      `yaml:"port"`
-	APIKeys []string `yaml:"api-keys"`
+	Host               string   `yaml:"host"`
+	Port               int      `yaml:"port"`
+	EnableAuth         *bool    `yaml:"enable-auth"`
+	APIKeys            []string `yaml:"api-keys"`
+	ToolDiagnosticsLog string   `yaml:"tool-diagnostics-log"`
 }
 
 type ProviderConfig struct {
-	Name    string            `yaml:"name"`
-	Type    string            `yaml:"type"`
-	BaseURL string            `yaml:"base-url"`
-	APIKey  string            `yaml:"api-key"`
-	Headers map[string]string `yaml:"headers"`
-	Models  []ModelConfig     `yaml:"models"`
+	Name      string            `yaml:"name"`
+	Type      string            `yaml:"type"`
+	BaseURL   string            `yaml:"base-url"`
+	APIKey    string            `yaml:"api-key"`
+	APIKeys   []string          `yaml:"api-keys"`
+	Proxy     string            `yaml:"proxy"`
+	CAFile    string            `yaml:"ca-file"`
+	Insecure  bool              `yaml:"insecure-skip-verify"`
+	Headers   map[string]string `yaml:"headers"`
+	AuthDir   string            `yaml:"auth-dir"`
+	Models    []ModelConfig     `yaml:"models"`
+	MaxTokens int               `yaml:"max-tokens"`
+	UseAPIKey bool              `yaml:"use-api-key"`
+}
+
+type CodexConfig struct {
+	CallbackBaseURL string `yaml:"callback-base-url"`
+}
+
+type KiroConfig struct {
+	CallbackBaseURL string `yaml:"callback-base-url"`
 }
 
 type ModelConfig struct {
@@ -87,5 +106,17 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.Server.Port == 0 {
 		cfg.Server.Port = 8080
 	}
+	for i := range cfg.Providers {
+		if err := validateProviderTransportConfig(&cfg.Providers[i]); err != nil {
+			return nil, fmt.Errorf("providers[%d]: %w", i, err)
+		}
+	}
 	return &cfg, nil
+}
+
+func (s ServerConfig) AuthEnabled() bool {
+	if s.EnableAuth != nil {
+		return *s.EnableAuth
+	}
+	return len(s.APIKeys) > 0
 }

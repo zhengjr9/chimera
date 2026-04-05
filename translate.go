@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -44,12 +45,8 @@ func claudeRequestToOpenAI(raw []byte, model string, stream bool) []byte {
 
 	// thinking -> reasoning_effort (best-effort mapping)
 	if tc := root.Get("thinking"); tc.Exists() && tc.IsObject() {
-		tp := tc.Get("type").String()
-		switch tp {
-		case "enabled":
-			out, _ = sjson.Set(out, "reasoning_effort", "high")
-		case "disabled":
-			out, _ = sjson.Set(out, "reasoning_effort", "low")
+		if effort := mapClaudeThinkingToReasoningEffort(tc); effort != "" {
+			out, _ = sjson.Set(out, "reasoning_effort", effort)
 		}
 	}
 
@@ -57,20 +54,18 @@ func claudeRequestToOpenAI(raw []byte, model string, stream bool) []byte {
 	msgsStr := "[]"
 	if sys := root.Get("system"); sys.Exists() {
 		sysMsg := `{"role":"system","content":[]}`
-		has := false
+		var systemParts []string
 		if sys.Type == gjson.String && sys.String() != "" {
-			sysMsg, _ = sjson.SetRaw(sysMsg, "content.-1", fmt.Sprintf(`{"type":"text","text":%q}`, sys.String()))
-			has = true
+			systemParts = append(systemParts, fmt.Sprintf(`{"type":"text","text":%q}`, sys.String()))
 		} else if sys.IsArray() {
 			sys.ForEach(func(_, v gjson.Result) bool {
 				if item, ok := convertContentPart(v); ok {
-					sysMsg, _ = sjson.SetRaw(sysMsg, "content.-1", item)
-					has = true
+					systemParts = append(systemParts, item)
 				}
 				return true
 			})
 		}
-		if has {
+		if applyMessageContent(&sysMsg, systemParts) {
 			msgsStr, _ = sjson.SetRaw(msgsStr, "-1", sysMsg)
 		}
 	}
@@ -88,9 +83,9 @@ func claudeRequestToOpenAI(raw []byte, model string, stream bool) []byte {
 
 				content.ForEach(func(_, part gjson.Result) bool {
 					switch part.Get("type").String() {
-					case "thinking":
+					case "thinking", "redacted_thinking":
 						if role == "assistant" {
-							t := part.Get("thinking").String()
+							t := extractClaudeThinkingText(part)
 							if strings.TrimSpace(t) != "" {
 								thinkingParts = append(thinkingParts, t)
 							}
@@ -101,15 +96,22 @@ func claudeRequestToOpenAI(raw []byte, model string, stream bool) []byte {
 						}
 					case "tool_use":
 						if role == "assistant" {
+							name := strings.TrimSpace(part.Get("name").String())
+							if name == "" {
+								return true
+							}
 							tc := `{"id":"","type":"function","function":{"name":"","arguments":""}}`
 							tc, _ = sjson.Set(tc, "id", part.Get("id").String())
-							tc, _ = sjson.Set(tc, "function.name", part.Get("name").String())
+							tc, _ = sjson.Set(tc, "function.name", name)
 							if input := part.Get("input"); input.Exists() {
 								tc, _ = sjson.Set(tc, "function.arguments", input.Raw)
 							}
 							toolCalls = append(toolCalls, gjson.Parse(tc).Value())
 						}
 					case "tool_result":
+						if strings.TrimSpace(part.Get("tool_use_id").String()) == "" {
+							return true
+						}
 						toolContent := toolResultContentToString(part.Get("content"))
 						if part.Get("is_error").Bool() {
 							toolContent = "ERROR: " + toolContent
@@ -134,13 +136,7 @@ func claudeRequestToOpenAI(raw []byte, model string, stream bool) []byte {
 
 				if role == "assistant" && (hasText || hasReason || hasTC) {
 					m := `{"role":"assistant"}`
-					if hasText {
-						arr := "[]"
-						for _, pp := range textParts {
-							arr, _ = sjson.SetRaw(arr, "-1", pp)
-						}
-						m, _ = sjson.SetRaw(m, "content", arr)
-					} else {
+					if !applyMessageContent(&m, textParts) {
 						m, _ = sjson.Set(m, "content", "")
 					}
 					if hasReason {
@@ -152,11 +148,7 @@ func claudeRequestToOpenAI(raw []byte, model string, stream bool) []byte {
 					msgsStr, _ = sjson.SetRaw(msgsStr, "-1", m)
 				} else if hasText {
 					m := fmt.Sprintf(`{"role":%q,"content":[]}`, role)
-					arr := "[]"
-					for _, pp := range textParts {
-						arr, _ = sjson.SetRaw(arr, "-1", pp)
-					}
-					m, _ = sjson.SetRaw(m, "content", arr)
+					applyMessageContent(&m, textParts)
 					msgsStr, _ = sjson.SetRaw(msgsStr, "-1", m)
 				}
 			} else if content.Exists() && content.Type == gjson.String {
@@ -175,12 +167,15 @@ func claudeRequestToOpenAI(raw []byte, model string, stream bool) []byte {
 	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
 		arr := "[]"
 		tools.ForEach(func(_, t gjson.Result) bool {
-			ot := `{"type":"function","function":{"name":"","description":""}}`
-			ot, _ = sjson.Set(ot, "function.name", t.Get("name").String())
-			ot, _ = sjson.Set(ot, "function.description", t.Get("description").String())
-			if schema := t.Get("input_schema"); schema.Exists() {
-				ot, _ = sjson.Set(ot, "function.parameters", schema.Value())
+			name := strings.TrimSpace(t.Get("name").String())
+			if name == "" {
+				return true
 			}
+			ot := `{"type":"function","function":{"name":"","description":""}}`
+			ot, _ = sjson.Set(ot, "function.name", name)
+			ot, _ = sjson.Set(ot, "function.description", t.Get("description").String())
+			ot, _ = sjson.SetRaw(ot, "function.parameters", normalizeToolParameters(t.Get("input_schema").Raw))
+			ot, _ = sjson.Set(ot, "function.strict", true)
 			arr, _ = sjson.SetRaw(arr, "-1", ot)
 			return true
 		})
@@ -327,6 +322,9 @@ type toolCallState struct {
 	name     string
 	args     strings.Builder
 	blockIdx int
+	started  bool
+	closed   bool
+	dropped  bool
 }
 
 func newStreamConverter() *streamConverter {
@@ -398,22 +396,31 @@ func (c *streamConverter) convert(raw []byte) []byte {
 				c.tools[idx] = &toolCallState{}
 			}
 			acc := c.tools[idx]
-			c.hasTool = true
 
 			if id := tc.Get("id"); id.Exists() {
 				acc.id = id.String()
 			}
 			if fn := tc.Get("function"); fn.Exists() {
 				if name := fn.Get("name"); name.Exists() {
-					acc.name = name.String()
+					acc.name = strings.TrimSpace(name.String())
+				}
+				if !acc.started && acc.name != "" {
+					c.hasTool = true
 					c.closeThinkBlock(&buf)
 					c.closeTextBlock(&buf)
 					acc.blockIdx = c.nextIdx
 					c.nextIdx++
+					acc.started = true
 					buf = append(buf, c.toolStart(acc.blockIdx, acc.id, acc.name)...)
+					if acc.args.Len() > 0 {
+						buf = append(buf, c.toolArgsDelta(acc.blockIdx, acc.args.String())...)
+					}
 				}
 				if args := fn.Get("arguments"); args.Exists() && args.String() != "" {
 					acc.args.WriteString(args.String())
+					if acc.started {
+						buf = append(buf, c.toolArgsDelta(acc.blockIdx, args.String())...)
+					}
 				}
 			}
 			return true
@@ -530,10 +537,12 @@ func (c *streamConverter) closeAllBlocks() []byte {
 
 	if !c.blocksClosed {
 		for idx, acc := range c.tools {
-			if acc.args.Len() > 0 {
-				buf = append(buf, c.toolArgsDelta(acc.blockIdx, fixJSON(acc.args.String()))...)
+			if !acc.started || acc.closed {
+				delete(c.tools, idx)
+				continue
 			}
 			buf = append(buf, c.blockStop(acc.blockIdx)...)
+			acc.closed = true
 			delete(c.tools, idx)
 		}
 		c.blocksClosed = true
@@ -564,6 +573,75 @@ func mapFinishReason(reason string, hasTool bool) string {
 	}
 }
 
+func mapClaudeThinkingToReasoningEffort(thinking gjson.Result) string {
+	switch strings.TrimSpace(thinking.Get("type").String()) {
+	case "disabled":
+		return "low"
+	case "adaptive":
+		return "medium"
+	case "enabled":
+		budget := thinking.Get("budget_tokens").Int()
+		switch {
+		case budget <= 0:
+			return "high"
+		case budget <= 2048:
+			return "low"
+		case budget <= 8192:
+			return "medium"
+		default:
+			return "high"
+		}
+	default:
+		if thinking.Get("budget_tokens").Exists() {
+			return "medium"
+		}
+		return ""
+	}
+}
+
+func extractClaudeThinkingText(part gjson.Result) string {
+	switch strings.TrimSpace(part.Get("type").String()) {
+	case "thinking":
+		return part.Get("thinking").String()
+	case "redacted_thinking":
+		data := strings.TrimSpace(part.Get("data").String())
+		if data == "" {
+			return "[redacted thinking]"
+		}
+		return fmt.Sprintf("[redacted thinking %d bytes]", len(data))
+	default:
+		return ""
+	}
+}
+
+func applyMessageContent(msg *string, parts []string) bool {
+	if len(parts) == 0 {
+		return false
+	}
+	if joined, ok := joinTextParts(parts); ok {
+		*msg, _ = sjson.Set(*msg, "content", joined)
+		return true
+	}
+	arr := "[]"
+	for _, pp := range parts {
+		arr, _ = sjson.SetRaw(arr, "-1", pp)
+	}
+	*msg, _ = sjson.SetRaw(*msg, "content", arr)
+	return true
+}
+
+func joinTextParts(parts []string) (string, bool) {
+	texts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		parsed := gjson.Parse(part)
+		if parsed.Get("type").String() != "text" {
+			return "", false
+		}
+		texts = append(texts, parsed.Get("text").String())
+	}
+	return strings.Join(texts, "\n\n"), true
+}
+
 func collectTexts(node gjson.Result) []string {
 	var out []string
 	if !node.Exists() {
@@ -586,7 +664,6 @@ func collectTexts(node gjson.Result) []string {
 	}
 	return out
 }
-
 func convertContentPart(part gjson.Result) (string, bool) {
 	switch part.Get("type").String() {
 	case "text":
@@ -631,25 +708,26 @@ func toolResultContentToString(content gjson.Result) string {
 		return content.String()
 	}
 	if content.IsArray() {
+		textOnly := true
 		var parts []string
 		content.ForEach(func(_, item gjson.Result) bool {
-			if item.Type == gjson.String {
+			switch {
+			case item.Type == gjson.String:
 				parts = append(parts, item.String())
-			} else if item.IsObject() {
-				if item.Get("text").Exists() {
-					parts = append(parts, item.Get("text").String())
-				} else {
-					parts = append(parts, item.Raw)
-				}
-			} else {
-				parts = append(parts, item.Raw)
+			case isPlainTextToolResultItem(item):
+				parts = append(parts, item.Get("text").String())
+			default:
+				textOnly = false
 			}
 			return true
 		})
-		return strings.Join(parts, "\n\n")
+		if textOnly {
+			return strings.Join(parts, "\n\n")
+		}
+		return content.Raw
 	}
 	if content.IsObject() {
-		if content.Get("text").Exists() {
+		if isPlainTextToolResultItem(content) {
 			return content.Get("text").String()
 		}
 		return content.Raw
@@ -657,39 +735,280 @@ func toolResultContentToString(content gjson.Result) string {
 	return content.Raw
 }
 
+func isPlainTextToolResultItem(item gjson.Result) bool {
+	if !item.IsObject() || !item.Get("text").Exists() {
+		return false
+	}
+	typ := strings.TrimSpace(item.Get("type").String())
+	return typ == "" || typ == "text"
+}
+
 func toolCallToClaudeBlock(tc gjson.Result) string {
 	id := tc.Get("id").String()
-	name := tc.Get("function.name").String()
+	name := strings.TrimSpace(tc.Get("function.name").String())
 	argsRaw := tc.Get("function.arguments").String()
 	block := fmt.Sprintf(`{"type":"tool_use","id":%q,"name":%q,"input":{}}`, id, name)
-	parsed := fixJSON(argsRaw)
-	if parsed != "" && gjson.Valid(parsed) && gjson.Parse(parsed).IsObject() {
+	if parsed, ok := parseToolArgumentsObject(argsRaw); ok {
+		parsed = normalizeClaudeToolArguments(name, parsed)
 		block, _ = sjson.SetRaw(block, "input", gjson.Parse(parsed).Raw)
 	}
 	return block
 }
 
+func normalizeClaudeToolArguments(toolName, raw string) string {
+	switch strings.TrimSpace(toolName) {
+	case "Edit":
+		return normalizeEditToolArguments(raw)
+	default:
+		return raw
+	}
+}
+
+func normalizeEditToolArguments(raw string) string {
+	if strings.TrimSpace(raw) == "" || !gjson.Valid(raw) || !gjson.Parse(raw).IsObject() {
+		return raw
+	}
+
+	var data map[string]any
+	if err := json.Unmarshal([]byte(raw), &data); err != nil {
+		return raw
+	}
+
+	renameArgumentAlias(data, "filePath", "file_path")
+	renameArgumentAlias(data, "path", "file_path")
+	renameArgumentAlias(data, "oldString", "old_string")
+	renameArgumentAlias(data, "old_text", "old_string")
+	renameArgumentAlias(data, "newString", "new_string")
+	renameArgumentAlias(data, "new_text", "new_string")
+	renameArgumentAlias(data, "replaceAll", "replace_all")
+
+	normalizeStringArgument(data, "file_path")
+	normalizeStringArgument(data, "old_string")
+	normalizeStringArgument(data, "new_string")
+	normalizeOptionalArgument(data, "replace_all")
+	normalizeBooleanArgument(data, "replace_all")
+
+	normalized, err := json.Marshal(data)
+	if err != nil {
+		return raw
+	}
+	return string(normalized)
+}
+
+func renameArgumentAlias(data map[string]any, alias, canonical string) {
+	if _, ok := data[canonical]; ok {
+		return
+	}
+	if value, ok := data[alias]; ok {
+		data[canonical] = value
+		delete(data, alias)
+	}
+}
+
+func normalizeOptionalArgument(data map[string]any, key string) {
+	value, ok := data[key]
+	if !ok {
+		return
+	}
+	switch v := value.(type) {
+	case nil:
+		delete(data, key)
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" || strings.EqualFold(trimmed, "null") || strings.EqualFold(trimmed, "undefined") {
+			delete(data, key)
+		}
+	}
+}
+
+func normalizeStringArgument(data map[string]any, key string) {
+	value, ok := data[key]
+	if !ok {
+		return
+	}
+	switch v := value.(type) {
+	case string:
+		return
+	case nil:
+		delete(data, key)
+	case bool:
+		if v {
+			data[key] = "true"
+		} else {
+			data[key] = "false"
+		}
+	case float64:
+		data[key] = fmt.Sprintf("%.0f", v)
+	default:
+		encoded, err := json.Marshal(v)
+		if err != nil {
+			delete(data, key)
+			return
+		}
+		data[key] = string(encoded)
+	}
+}
+
+func normalizeBooleanArgument(data map[string]any, key string) {
+	value, ok := data[key]
+	if !ok {
+		return
+	}
+	switch v := value.(type) {
+	case string:
+		trimmed := strings.TrimSpace(v)
+		switch {
+		case strings.EqualFold(trimmed, "true"):
+			data[key] = true
+		case strings.EqualFold(trimmed, "false"):
+			data[key] = false
+		}
+	}
+}
+
+func normalizeToolParameters(raw string) string {
+	if strings.TrimSpace(raw) == "" || !gjson.Valid(raw) {
+		return `{"type":"object","properties":{},"additionalProperties":false}`
+	}
+	schema := raw
+	parsed := gjson.Parse(raw)
+	if !parsed.IsObject() {
+		return `{"type":"object","properties":{},"additionalProperties":false}`
+	}
+	return normalizeSchemaObject(schema)
+}
+
 // fixJSON is a best-effort fix for truncated JSON (e.g., from streaming).
 func fixJSON(s string) string {
-	if parsed := parseTaggedToolArguments(s); parsed != "" {
+	if parsed, ok := parseToolArgumentsObject(s); ok {
 		return parsed
 	}
-	if gjson.Valid(s) {
-		return s
+	return "{}"
+}
+
+func parseToolArgumentsObject(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false
 	}
-	// Try to close open braces/brackets
+	if parsed := parseTaggedToolArguments(raw); parsed != "" {
+		return parsed, true
+	}
+	if gjson.Valid(raw) && gjson.Parse(raw).IsObject() {
+		return raw, true
+	}
+	if obj, ok := extractFirstJSONObject(raw); ok && gjson.Valid(obj) && gjson.Parse(obj).IsObject() {
+		return obj, true
+	}
+	if obj, ok := repairDuplicatedJSONObject(raw); ok && gjson.Valid(obj) && gjson.Parse(obj).IsObject() {
+		return obj, true
+	}
+
+	candidates := []string{}
+	if looksLikeJSONObjectBody(raw) {
+		candidates = append(candidates, "{"+raw+"}")
+	}
+	if candidate, ok := closeJSONObject(raw); ok {
+		candidates = append(candidates, candidate)
+	}
+
+	for _, candidate := range candidates {
+		candidate = trimDanglingCommas(candidate)
+		if gjson.Valid(candidate) && gjson.Parse(candidate).IsObject() {
+			return candidate, true
+		}
+	}
+
+	return "", false
+}
+
+func looksLikeJSONObjectBody(raw string) bool {
+	if strings.HasPrefix(raw, "{") || strings.HasPrefix(raw, "[") {
+		return false
+	}
+	if !strings.Contains(raw, ":") {
+		return false
+	}
+	if strings.Contains(raw, "\n") && len(raw) > 512 {
+		return false
+	}
+	return true
+}
+
+func closeJSONObject(s string) (string, bool) {
+	const maxAutoCloseDepth = 16
+	const maxAutoCloseInputLen = 4096
+	if len(s) > maxAutoCloseInputLen {
+		return "", false
+	}
 	openBraces := strings.Count(s, "{") - strings.Count(s, "}")
 	openBrackets := strings.Count(s, "[") - strings.Count(s, "]")
+	if openBraces < 0 || openBrackets < 0 {
+		return "", false
+	}
+	if openBraces == 0 && openBrackets == 0 {
+		return s, true
+	}
+	if openBraces > maxAutoCloseDepth || openBrackets > maxAutoCloseDepth {
+		return "", false
+	}
 	for i := 0; i < openBrackets; i++ {
 		s += "]"
 	}
 	for i := 0; i < openBraces; i++ {
 		s += "}"
 	}
-	if gjson.Valid(s) {
-		return s
+	return s, true
+}
+
+func trimDanglingCommas(s string) string {
+	replacer := strings.NewReplacer(",}", "}", ",]", "]")
+	for {
+		next := replacer.Replace(s)
+		if next == s {
+			return s
+		}
+		s = next
 	}
-	return "{}"
+}
+
+func normalizeSchemaObject(schema string) string {
+	schema, _ = sjson.Delete(schema, "$schema")
+
+	parsed := gjson.Parse(schema)
+	if !parsed.IsObject() {
+		return `{"type":"object","properties":{},"additionalProperties":false}`
+	}
+	if !parsed.Get("type").Exists() {
+		schema, _ = sjson.Set(schema, "type", "object")
+	}
+
+	switch gjson.Get(schema, "type").String() {
+	case "object":
+		if !gjson.Get(schema, "properties").Exists() {
+			schema, _ = sjson.SetRaw(schema, "properties", `{}`)
+		}
+		if !gjson.Get(schema, "additionalProperties").Exists() {
+			schema, _ = sjson.Set(schema, "additionalProperties", false)
+		}
+		props := gjson.Get(schema, "properties")
+		if props.Exists() && props.IsObject() {
+			props.ForEach(func(key, value gjson.Result) bool {
+				if value.IsObject() {
+					nested := normalizeSchemaObject(value.Raw)
+					schema, _ = sjson.SetRaw(schema, "properties."+key.String(), nested)
+				}
+				return true
+			})
+		}
+	case "array":
+		items := gjson.Get(schema, "items")
+		if items.Exists() && items.IsObject() {
+			schema, _ = sjson.SetRaw(schema, "items", normalizeSchemaObject(items.Raw))
+		}
+	}
+
+	return schema
 }
 
 var taggedToolArgPattern = regexp.MustCompile(`(?s)<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s*</arg_value>`)

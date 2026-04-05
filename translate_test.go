@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -20,6 +21,75 @@ func TestToolCallToClaudeBlockParsesTaggedArguments(t *testing.T) {
 	block := toolCallToClaudeBlock(parseJSON(raw))
 	if !strings.Contains(block, `"input":{"city":"Hangzhou"}`) {
 		t.Fatalf("expected Claude tool input to contain parsed city, got %s", block)
+	}
+}
+
+func TestToolCallToClaudeBlockRepairsDuplicatedJSONObjectArguments(t *testing.T) {
+	raw := `{"id":"tool_1","function":{"name":"exec_command","arguments":"{\"cmd\":\"cat README.md\"{\"cmd\":\"cat README.md\"}"}}`
+	block := toolCallToClaudeBlock(parseJSON(raw))
+	if !strings.Contains(block, `"input":{"cmd":"cat README.md"}`) {
+		t.Fatalf("expected repaired tool input, got %s", block)
+	}
+}
+
+func TestToolCallToClaudeBlockWrapsBareObjectBodyArguments(t *testing.T) {
+	raw := `{"id":"tool_1","function":{"name":"exec_command","arguments":"\"cmd\":\"pwd\""}}`
+	block := toolCallToClaudeBlock(parseJSON(raw))
+	if !strings.Contains(block, `"input":{"cmd":"pwd"}`) {
+		t.Fatalf("expected wrapped tool input, got %s", block)
+	}
+}
+
+func TestToolCallToClaudeBlockNormalizesEditAliases(t *testing.T) {
+	raw := `{"id":"tool_1","function":{"name":"Edit","arguments":"{\"filePath\":\"/tmp/a.txt\",\"oldString\":\"before\",\"newString\":\"after\",\"replaceAll\":\"true\"}"}}`
+	block := toolCallToClaudeBlock(parseJSON(raw))
+	if !strings.Contains(block, `"file_path":"/tmp/a.txt"`) {
+		t.Fatalf("expected file_path alias normalization, got %s", block)
+	}
+	if !strings.Contains(block, `"old_string":"before"`) {
+		t.Fatalf("expected old_string alias normalization, got %s", block)
+	}
+	if !strings.Contains(block, `"new_string":"after"`) {
+		t.Fatalf("expected new_string alias normalization, got %s", block)
+	}
+	if !strings.Contains(block, `"replace_all":true`) {
+		t.Fatalf("expected replace_all bool normalization, got %s", block)
+	}
+}
+
+func TestToolCallToClaudeBlockNormalizesAdditionalEditAliases(t *testing.T) {
+	raw := `{"id":"tool_1","function":{"name":"Edit","arguments":"{\"path\":\"/tmp/a.txt\",\"old_text\":\"before\",\"new_text\":\"after\"}"}}`
+	block := toolCallToClaudeBlock(parseJSON(raw))
+	if !strings.Contains(block, `"file_path":"/tmp/a.txt"`) {
+		t.Fatalf("expected path alias normalization, got %s", block)
+	}
+	if !strings.Contains(block, `"old_string":"before"`) {
+		t.Fatalf("expected old_text alias normalization, got %s", block)
+	}
+	if !strings.Contains(block, `"new_string":"after"`) {
+		t.Fatalf("expected new_text alias normalization, got %s", block)
+	}
+}
+
+func TestToolCallToClaudeBlockDropsInvalidOptionalEditReplaceAll(t *testing.T) {
+	raw := `{"id":"tool_1","function":{"name":"Edit","arguments":"{\"file_path\":\"/tmp/a.txt\",\"old_string\":\"before\",\"new_string\":\"after\",\"replace_all\":\"undefined\"}"}}`
+	block := toolCallToClaudeBlock(parseJSON(raw))
+	if strings.Contains(block, `"replace_all"`) {
+		t.Fatalf("expected replace_all to be dropped, got %s", block)
+	}
+}
+
+func TestToolCallToClaudeBlockStringifiesEditRequiredFields(t *testing.T) {
+	raw := `{"id":"tool_1","function":{"name":"Edit","arguments":"{\"file_path\":123,\"old_string\":false,\"new_string\":{\"text\":\"after\"}}"}}`
+	block := toolCallToClaudeBlock(parseJSON(raw))
+	if !strings.Contains(block, `"file_path":"123"`) {
+		t.Fatalf("expected file_path stringification, got %s", block)
+	}
+	if !strings.Contains(block, `"old_string":"false"`) {
+		t.Fatalf("expected old_string stringification, got %s", block)
+	}
+	if !strings.Contains(block, `"new_string":"{\"text\":\"after\"}"`) {
+		t.Fatalf("expected new_string object stringification, got %s", block)
 	}
 }
 
@@ -66,6 +136,9 @@ func TestClaudeRequestToOpenAIBasic(t *testing.T) {
 	if messages[0].Get("role").String() != "user" {
 		t.Errorf("expected role user, got %q", messages[0].Get("role").String())
 	}
+	if messages[0].Get("content").String() != "Hello, world!" {
+		t.Errorf("expected plain string content, got %s", messages[0].Get("content").Raw)
+	}
 }
 
 func TestClaudeRequestToOpenAIWithSystem(t *testing.T) {
@@ -86,6 +159,9 @@ func TestClaudeRequestToOpenAIWithSystem(t *testing.T) {
 	}
 	if messages[0].Get("role").String() != "system" {
 		t.Errorf("expected first message role system, got %q", messages[0].Get("role").String())
+	}
+	if messages[0].Get("content").String() != "You are a helpful assistant." {
+		t.Errorf("expected plain string system content, got %s", messages[0].Get("content").Raw)
 	}
 }
 
@@ -141,6 +217,62 @@ func TestClaudeRequestToOpenAIWithThinking(t *testing.T) {
 	}
 }
 
+func TestClaudeRequestToOpenAIWithAdaptiveThinking(t *testing.T) {
+	claudeReq := `{
+		"model": "claude-3-opus",
+		"thinking": {"type": "adaptive"},
+		"messages": [
+			{"role": "user", "content": "Hello"}
+		]
+	}`
+
+	openaiReq := claudeRequestToOpenAI([]byte(claudeReq), "gpt-4", false)
+	parsed := gjson.ParseBytes(openaiReq)
+
+	if parsed.Get("reasoning_effort").String() != "medium" {
+		t.Errorf("expected reasoning_effort medium, got %q", parsed.Get("reasoning_effort").String())
+	}
+}
+
+func TestClaudeRequestToOpenAIWithThinkingBudget(t *testing.T) {
+	claudeReq := `{
+		"model": "claude-3-opus",
+		"thinking": {"type": "enabled", "budget_tokens": 2048},
+		"messages": [
+			{"role": "user", "content": "Hello"}
+		]
+	}`
+
+	openaiReq := claudeRequestToOpenAI([]byte(claudeReq), "gpt-4", false)
+	parsed := gjson.ParseBytes(openaiReq)
+
+	if parsed.Get("reasoning_effort").String() != "low" {
+		t.Errorf("expected reasoning_effort low, got %q", parsed.Get("reasoning_effort").String())
+	}
+}
+
+func TestClaudeRequestToOpenAIWithRedactedThinking(t *testing.T) {
+	claudeReq := `{
+		"model": "claude-3-opus",
+		"messages": [
+			{"role": "assistant", "content": [
+				{"type": "redacted_thinking", "data": "abcdef"},
+				{"type": "text", "text": "Continuing"}
+			]}
+		]
+	}`
+
+	openaiReq := claudeRequestToOpenAI([]byte(claudeReq), "gpt-4", false)
+	parsed := gjson.ParseBytes(openaiReq)
+
+	if got := parsed.Get("messages.0.reasoning_content").String(); got != "[redacted thinking 6 bytes]" {
+		t.Fatalf("expected redacted thinking marker, got %q", got)
+	}
+	if got := parsed.Get("messages.0.content").String(); got != "Continuing" {
+		t.Fatalf("expected assistant text content preserved, got %q", got)
+	}
+}
+
 func TestClaudeRequestToOpenAIWithTools(t *testing.T) {
 	claudeReq := `{
 		"model": "claude-3-opus",
@@ -170,6 +302,52 @@ func TestClaudeRequestToOpenAIWithTools(t *testing.T) {
 	}
 	if tools[0].Get("function.name").String() != "get_weather" {
 		t.Errorf("expected function name get_weather, got %q", tools[0].Get("function.name").String())
+	}
+	if !tools[0].Get("function.strict").Bool() {
+		t.Fatalf("expected strict function schema, got %s", tools[0].Raw)
+	}
+	if tools[0].Get("function.parameters.additionalProperties").Exists() && tools[0].Get("function.parameters.additionalProperties").Bool() {
+		t.Fatalf("expected additionalProperties false, got %s", tools[0].Get("function.parameters").Raw)
+	}
+}
+
+func TestClaudeRequestToOpenAIFiltersInvalidToolsAndResults(t *testing.T) {
+	claudeReq := `{
+		"model": "claude-3-opus",
+		"tools": [
+			{"name": "", "input_schema": {"type": "object"}},
+			{"name": "valid_tool", "input_schema": {}}
+		],
+		"messages": [
+			{"role": "assistant", "content": [
+				{"type": "tool_use", "id": "", "name": "", "input": {}},
+				{"type": "tool_use", "id": "tool_1", "name": "valid_tool", "input": {"ok": true}}
+			]},
+			{"role": "user", "content": [
+				{"type": "tool_result", "tool_use_id": "", "content": "bad"},
+				{"type": "tool_result", "tool_use_id": "tool_1", "content": "ok"}
+			]}
+		]
+	}`
+
+	openaiReq := claudeRequestToOpenAI([]byte(claudeReq), "gpt-4", false)
+	parsed := gjson.ParseBytes(openaiReq)
+
+	tools := parsed.Get("tools").Array()
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 valid tool, got %d", len(tools))
+	}
+	if tools[0].Get("function.parameters.type").String() != "object" {
+		t.Fatalf("expected normalized object schema, got %s", tools[0].Get("function.parameters").Raw)
+	}
+
+	toolCalls := parsed.Get("messages.0.tool_calls").Array()
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 valid tool call, got %d", len(toolCalls))
+	}
+
+	if got := parsed.Get("messages.1.tool_call_id").String(); got != "tool_1" {
+		t.Fatalf("expected preserved valid tool_result, got %q", got)
 	}
 }
 
@@ -277,6 +455,14 @@ func TestToolResultContentToStringObjectPreservesJSON(t *testing.T) {
 	}
 }
 
+func TestToolResultContentToStringArrayPreservesStructuredJSON(t *testing.T) {
+	content := gjson.Parse(`[{"type":"text","text":"done"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]`)
+	got := toolResultContentToString(content)
+	if got != `[{"type":"text","text":"done"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]` {
+		t.Fatalf("expected structured array JSON, got %q", got)
+	}
+}
+
 func TestClaudeRequestToOpenAIWithImage(t *testing.T) {
 	claudeReq := `{
 		"model": "claude-3-opus",
@@ -311,6 +497,28 @@ func TestClaudeRequestToOpenAIWithImage(t *testing.T) {
 	imageURL := content[1].Get("image_url.url").String()
 	if !strings.HasPrefix(imageURL, "data:image/png;base64,") {
 		t.Errorf("expected data URL prefix, got %q", imageURL[:50])
+	}
+}
+
+func TestClaudeRequestToOpenAIPreservesArrayContentWhenImagesPresent(t *testing.T) {
+	claudeReq := `{
+		"model": "claude-3-opus",
+		"messages": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "text", "text": "What's in this image?"},
+					{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "base64data"}}
+				]
+			}
+		]
+	}`
+
+	openaiReq := claudeRequestToOpenAI([]byte(claudeReq), "gpt-4", false)
+	parsed := gjson.ParseBytes(openaiReq)
+
+	if !parsed.Get("messages.0.content").IsArray() {
+		t.Fatalf("expected content array when image exists, got %s", parsed.Get("messages.0.content").Raw)
 	}
 }
 
@@ -524,6 +732,77 @@ func TestFixJSONEmpty(t *testing.T) {
 	}
 }
 
+func TestFixJSONWrapsBareObjectBody(t *testing.T) {
+	input := `"cmd":"pwd"`
+	got := fixJSON(input)
+	if got != `{"cmd":"pwd"}` {
+		t.Fatalf("expected wrapped object, got %q", got)
+	}
+}
+
+func TestFixJSONDoesNotExplodeOnBraceHeavyText(t *testing.T) {
+	input := `{"old_string":"func x() { if a { if b { if c { if d { if e { if f { if g { if h { if i { if j { if k { if l { if m { if n { if o { if p {`
+	got := fixJSON(input)
+	if got != "{}" {
+		t.Fatalf("expected pathological brace-heavy text to fall back to empty object, got %q", got)
+	}
+}
+
+func TestToolCallToClaudeBlockPreservesLargeWriteArguments(t *testing.T) {
+	huge := strings.Repeat("a", 256<<10)
+	args := fmt.Sprintf(`{"file_path":"/tmp/out.txt","content":%q}`, huge)
+	raw := fmt.Sprintf(`{"id":"tool_1","function":{"name":"Write","arguments":%q}}`, args)
+	block := toolCallToClaudeBlock(parseJSON(raw))
+	if !strings.Contains(block, `"/tmp/out.txt"`) || !strings.Contains(block, huge) {
+		t.Fatalf("expected large write args to be preserved, got %s", block)
+	}
+}
+
+func TestStreamConverterEmitsIncrementalToolArgs(t *testing.T) {
+	conv := newStreamConverter()
+
+	first := conv.convert([]byte(`{"id":"msg_1","model":"glm-5","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"Write","arguments":"{\"file_path\":\"a"}}]}}]}`))
+	if !strings.Contains(string(first), `"type":"input_json_delta"`) {
+		t.Fatalf("expected incremental tool args delta, got %s", string(first))
+	}
+
+	second := conv.convert([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\",\"content\":\"b\"}"}}]}}]}`))
+	if !strings.Contains(string(second), `"partial_json":"\",\"content\":\"b\"}"`) {
+		t.Fatalf("expected second incremental args delta, got %s", string(second))
+	}
+}
+
+func TestStreamConverterPreservesToolArgsBeforeNameArrives(t *testing.T) {
+	conv := newStreamConverter()
+
+	first := conv.convert([]byte(`{"id":"msg_1","model":"glm-5","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"arguments":"{\"file_path\":\"a\""}}]}}]}`))
+	if strings.Contains(string(first), `"type":"input_json_delta"`) {
+		t.Fatalf("did not expect args delta before tool name arrives, got %s", string(first))
+	}
+
+	second := conv.convert([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"Write","arguments":"}"}}]}}]}`))
+	if !strings.Contains(string(second), `"type":"tool_use"`) {
+		t.Fatalf("expected tool_use block after name arrives, got %s", string(second))
+	}
+	if !strings.Contains(string(second), `"partial_json":"{\"file_path\":\"a\""`) {
+		t.Fatalf("expected buffered args to flush once tool starts, got %s", string(second))
+	}
+	if !strings.Contains(string(second), `"partial_json":"}"`) {
+		t.Fatalf("expected trailing args chunk to be preserved, got %s", string(second))
+	}
+}
+
+func TestStreamConverterPreservesLargeWriteArgs(t *testing.T) {
+	conv := newStreamConverter()
+	huge := strings.Repeat("a", 256<<10)
+	chunk := fmt.Sprintf(`{"id":"msg_1","model":"glm-5","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"Write","arguments":%q}}]}}]}`, huge)
+
+	got := conv.convert([]byte(chunk))
+	if !strings.Contains(string(got), `"type":"input_json_delta"`) || !strings.Contains(string(got), huge) {
+		t.Fatalf("expected large write args delta to be preserved, got %s", string(got))
+	}
+}
+
 func TestConvertContentPartText(t *testing.T) {
 	part := `{"type": "text", "text": "Hello"}`
 	result, ok := convertContentPart(gjson.Parse(part))
@@ -601,6 +880,16 @@ func TestToolResultContentToString(t *testing.T) {
 			name:    "object with text",
 			content: `{"text": "result"}`,
 			want:    "result",
+		},
+		{
+			name:    "object with type text",
+			content: `{"type":"text","text":"result"}`,
+			want:    "result",
+		},
+		{
+			name:    "structured array preserved",
+			content: `[{"type":"text","text":"part1"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]`,
+			want:    `[{"type":"text","text":"part1"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]`,
 		},
 	}
 

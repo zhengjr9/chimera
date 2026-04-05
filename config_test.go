@@ -232,3 +232,172 @@ providers:
 		t.Errorf("unexpected header value: %v", cfg.Providers[0].Headers)
 	}
 }
+
+func TestLoadConfigProviderProxy(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	content := `
+server:
+  port: 8080
+providers:
+  - name: minimax
+    base-url: https://api.minimax.io/v1
+    api-key: test-key
+    proxy: direct
+    models:
+      - name: MiniMax-M2.7
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	if cfg.Providers[0].Proxy != "direct" {
+		t.Fatalf("expected provider proxy to be loaded, got %q", cfg.Providers[0].Proxy)
+	}
+}
+
+func TestLoadConfigInvalidProviderProxy(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	content := `
+providers:
+  - name: minimax
+    base-url: https://api.minimax.io/v1
+    api-key: test-key
+    proxy: http://
+    models:
+      - name: MiniMax-M2.7
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err := LoadConfig(cfgPath)
+	if err == nil {
+		t.Fatal("expected invalid provider proxy error")
+	}
+}
+
+func TestLoadConfigProviderInsecureSkipVerify(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	content := `
+providers:
+  - name: minimax
+    base-url: https://api.minimax.io/v1
+    api-key: test-key
+    insecure-skip-verify: true
+    models:
+      - name: MiniMax-M2.7
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	if !cfg.Providers[0].Insecure {
+		t.Fatal("expected insecure-skip-verify to be enabled")
+	}
+}
+
+func TestLoadConfigInvalidProviderCAFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	content := `
+providers:
+  - name: minimax
+    base-url: https://api.minimax.io/v1
+    api-key: test-key
+    ca-file: /nonexistent/corp-ca.pem
+    models:
+      - name: MiniMax-M2.7
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err := LoadConfig(cfgPath)
+	if err == nil {
+		t.Fatal("expected invalid provider ca-file error")
+	}
+}
+
+func TestLoadConfigToolDiagnosticsLog(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	content := `
+server:
+  tool-diagnostics-log: /tmp/chimera-tools.jsonl
+providers:
+  - name: test
+    base-url: http://localhost:8080
+    api-key: test-key
+    models:
+      - name: test-model
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	if cfg.Server.ToolDiagnosticsLog != "/tmp/chimera-tools.jsonl" {
+		t.Fatalf("expected tool diagnostics path, got %q", cfg.Server.ToolDiagnosticsLog)
+	}
+}
+
+func TestLoadConfigEnableAuthFalse(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	content := `
+server:
+  enable-auth: false
+  api-keys:
+    - key1
+providers:
+  - name: test
+    base-url: http://localhost:8080
+    api-key: test-key
+    models:
+      - name: test-model
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	if cfg.Server.EnableAuth == nil {
+		t.Fatal("expected enable-auth to be set")
+	}
+	if cfg.Server.AuthEnabled() {
+		t.Fatal("expected auth to be disabled")
+	}
+}
+
+func TestServerConfigAuthEnabledLegacyFallback(t *testing.T) {
+	cfg := ServerConfig{APIKeys: []string{"key1"}}
+	if !cfg.AuthEnabled() {
+		t.Fatal("expected auth to be enabled when api-keys are configured")
+	}
+
+	cfg = ServerConfig{}
+	if cfg.AuthEnabled() {
+		t.Fatal("expected auth to be disabled when enable-auth is unset and api-keys are empty")
+	}
+}

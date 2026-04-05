@@ -24,6 +24,9 @@ func TestConvertResponsesRequestToChatCompletionsIgnoresCustomTools(t *testing.T
 	if gjson.GetBytes(converted, "tools.0.function.name").String() != "exec_command" {
 		t.Fatalf("tools=%s", converted)
 	}
+	if !gjson.GetBytes(converted, "tools.0.function.strict").Bool() {
+		t.Fatalf("tools=%s", converted)
+	}
 }
 
 func TestConvertResponsesRequestToChatCompletionsConvertsFunctionCallOutput(t *testing.T) {

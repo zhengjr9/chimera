@@ -122,28 +122,30 @@ func convertResponsesRequestToChatCompletions(modelName string, inputRawJSON []b
 		var chatTools []interface{}
 		tools.ForEach(func(_, tool gjson.Result) bool {
 			toolType := tool.Get("type").String()
-			if toolType != "" && toolType != "function" {
+			switch toolType {
+			case "", "function":
+				name := strings.TrimSpace(firstNonEmpty(tool.Get("name").String(), tool.Get("function.name").String()))
+				if name == "" {
+					return true
+				}
+
+				chatTool := `{"type":"function","function":{"name":"","description":"","parameters":{}}}`
+				chatTool, _ = sjson.Set(chatTool, "function.name", name)
+				if v := firstNonEmpty(tool.Get("description").String(), tool.Get("function.description").String()); v != "" {
+					chatTool, _ = sjson.Set(chatTool, "function.description", v)
+				}
+				parameters := tool.Get("parameters")
+				if !parameters.Exists() {
+					parameters = tool.Get("input_schema")
+				}
+				if parameters.Exists() {
+					chatTool, _ = sjson.SetRaw(chatTool, "function.parameters", normalizeToolParameters(parameters.Raw))
+				}
+				chatTool, _ = sjson.Set(chatTool, "function.strict", true)
+				chatTools = append(chatTools, gjson.Parse(chatTool).Value())
+			default:
 				return true
 			}
-
-			name := strings.TrimSpace(firstNonEmpty(tool.Get("name").String(), tool.Get("function.name").String()))
-			if name == "" {
-				return true
-			}
-
-			chatTool := `{"type":"function","function":{"name":"","description":"","parameters":{}}}`
-			chatTool, _ = sjson.Set(chatTool, "function.name", name)
-			if v := firstNonEmpty(tool.Get("description").String(), tool.Get("function.description").String()); v != "" {
-				chatTool, _ = sjson.Set(chatTool, "function.description", v)
-			}
-			parameters := tool.Get("parameters")
-			if !parameters.Exists() {
-				parameters = tool.Get("input_schema")
-			}
-			if parameters.Exists() {
-				chatTool, _ = sjson.SetRaw(chatTool, "function.parameters", parameters.Raw)
-			}
-			chatTools = append(chatTools, gjson.Parse(chatTool).Value())
 			return true
 		})
 		if len(chatTools) > 0 {

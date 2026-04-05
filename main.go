@@ -14,6 +14,30 @@ import (
 
 func main() {
 	cfgPath := "config.yaml"
+	if len(os.Args) > 1 && os.Args[1] == "codex" {
+		if err := runCodexCLI(os.Args[2:]); err != nil {
+			log.Fatalf("codex: %v", err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "--kiro-login" {
+		if err := runKiroLoginCLI(os.Args[2:]); err != nil {
+			log.Fatalf("kiro-login: %v", err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "--codex-login" {
+		if err := runCodexLoginCommand(os.Args[2:]); err != nil {
+			log.Fatalf("codex-login: %v", err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "--kiro-import-cli-token" {
+		if err := runKiroImportCLIToken(os.Args[2:]); err != nil {
+			log.Fatalf("kiro-import-cli-token: %v", err)
+		}
+		return
+	}
 	if len(os.Args) > 1 {
 		cfgPath = os.Args[1]
 	}
@@ -24,15 +48,23 @@ func main() {
 	}
 
 	p := NewProxy(cfg)
+	defer p.Close()
 
 	mux := http.NewServeMux()
-	auth := authMiddleware(cfg.Server.APIKeys)
+	auth := authMiddleware(cfg.Server.AuthEnabled(), cfg.Server.APIKeys)
 
 	mux.Handle("/v1/messages", auth(http.HandlerFunc(p.handleMessages)))
+	mux.Handle("/v1/messages/count_tokens", auth(http.HandlerFunc(p.handleClaudeCountTokens)))
 	mux.Handle("/v1/chat/completions", auth(http.HandlerFunc(p.handleChatCompletions)))
 	mux.Handle("/v1/responses", auth(http.HandlerFunc(p.handleResponses)))
 	mux.Handle("/v1/responses/compact", auth(http.HandlerFunc(p.handleResponsesCompact)))
 	mux.Handle("/v1/models", auth(http.HandlerFunc(p.handleModels)))
+	mux.Handle("/auth/codex/login", auth(http.HandlerFunc(p.handleCodexLoginStart)))
+	mux.Handle("/auth/codex/callback", http.HandlerFunc(p.handleCodexLoginCallback))
+	mux.Handle("/auth/codex/accounts", auth(http.HandlerFunc(p.handleCodexAccounts)))
+	mux.Handle("/auth/kiro/login", auth(http.HandlerFunc(p.handleKiroLoginStart)))
+	mux.Handle("/auth/kiro/callback", http.HandlerFunc(p.handleKiroLoginCallback))
+	mux.Handle("/oauth/callback", http.HandlerFunc(p.handleKiroLoginCallback))
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	srv := &http.Server{Addr: addr, Handler: corsMiddleware(mux)}
@@ -54,8 +86,8 @@ func main() {
 	srv.Shutdown(ctx)
 }
 
-func authMiddleware(apiKeys []string) func(http.Handler) http.Handler {
-	if len(apiKeys) == 0 {
+func authMiddleware(enabled bool, apiKeys []string) func(http.Handler) http.Handler {
+	if !enabled || len(apiKeys) == 0 {
 		return func(next http.Handler) http.Handler { return next }
 	}
 	set := make(map[string]bool, len(apiKeys))

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 var passthroughRequestHeaders = []string{
@@ -40,34 +42,124 @@ type routeEntry struct {
 }
 
 type Proxy struct {
-	cfg    *Config
-	routes map[string]routeEntry
-	client *http.Client
+	cfg              *Config
+	routes           map[string]routeEntry
+	client           *http.Client
+	providerClients  map[string]*http.Client
+	toolDiag         *toolDiagnosticLogger
+	codexPools       map[string]*codexAccountPool
+	codexOAuthStates *codexOAuthStateStore
+	kiroOAuthStates  *kiroOAuthStateStore
+}
+
+type streamedToolCallLog struct {
+	ID     string
+	Name   string
+	Args   strings.Builder
+	Chunks int
+	Logged bool
 }
 
 var requestSeq uint64
 
 func NewProxy(cfg *Config) *Proxy {
+	defaultClient, err := newHTTPClient("", "", false)
+	if err != nil {
+		log.Printf("default HTTP client setup failed, falling back to zero-value client: %v", err)
+		defaultClient = &http.Client{}
+	}
+	toolDiag, err := newToolDiagnosticLogger(cfg.Server.ToolDiagnosticsLog)
+	if err != nil {
+		log.Printf("tool diagnostics disabled: %v", err)
+	}
 	p := &Proxy{
-		cfg:    cfg,
-		routes: make(map[string]routeEntry),
-		client: &http.Client{},
+		cfg:              cfg,
+		routes:           make(map[string]routeEntry),
+		client:           defaultClient,
+		providerClients:  make(map[string]*http.Client),
+		toolDiag:         toolDiag,
+		codexPools:       make(map[string]*codexAccountPool),
+		codexOAuthStates: newCodexOAuthStateStore(),
+		kiroOAuthStates:  newKiroOAuthStateStore(),
 	}
 	for i := range cfg.Providers {
 		prov := &cfg.Providers[i]
+		client := p.client
+		if strings.TrimSpace(prov.Proxy) != "" {
+			var err error
+			client, err = newHTTPClient(prov.Proxy, prov.CAFile, prov.Insecure)
+			if err != nil {
+				log.Printf("provider client setup failed for %s, falling back to default client: %v", prov.Name, err)
+				client = p.client
+			}
+		} else if strings.TrimSpace(prov.CAFile) != "" || prov.Insecure {
+			var err error
+			client, err = newHTTPClient("", prov.CAFile, prov.Insecure)
+			if err != nil {
+				log.Printf("provider client setup failed for %s, falling back to default client: %v", prov.Name, err)
+				client = p.client
+			}
+		}
+		p.providerClients[prov.Name] = client
+		if strings.EqualFold(strings.TrimSpace(prov.Type), "codex") && strings.TrimSpace(prov.AuthDir) != "" {
+			pool, err := newCodexAccountPool(prov.AuthDir, client)
+			if err != nil {
+				log.Printf("codex auth pool disabled for provider=%s: %v", prov.Name, err)
+			} else if pool != nil {
+				p.codexPools[prov.Name] = pool
+			}
+		}
+		log.Printf("provider client configured provider=%s proxy=%s tls=%s", prov.Name, describeProxyMode(prov.Proxy), describeTLSMode(prov.CAFile, prov.Insecure))
 		for _, m := range prov.Models {
 			p.routes[m.Name] = routeEntry{provider: prov, model: m.Name}
+			for _, extra := range providerModelAliases(*prov, m) {
+				p.routes[extra] = routeEntry{provider: prov, model: m.Name}
+			}
 			for _, alias := range modelAliases(m) {
 				p.routes[alias] = routeEntry{provider: prov, model: m.Name}
+				for _, extra := range providerAliasVariants(*prov, alias) {
+					p.routes[extra] = routeEntry{provider: prov, model: m.Name}
+				}
 			}
 		}
 	}
 	return p
 }
 
-func (p *Proxy) resolve(model string) (routeEntry, bool) {
-	r, ok := p.routes[model]
-	return r, ok
+func (p *Proxy) Close() error {
+	stopCodexCallbackForwarder()
+	if p == nil || p.toolDiag == nil {
+		return nil
+	}
+	return p.toolDiag.Close()
+}
+
+func (p *Proxy) findProviderByName(name string) *ProviderConfig {
+	if p == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(name)
+	for i := range p.cfg.Providers {
+		if p.cfg.Providers[i].Name == trimmed {
+			return &p.cfg.Providers[i]
+		}
+	}
+	return nil
+}
+
+func (p *Proxy) httpClientForProvider(prov *ProviderConfig) *http.Client {
+	if p == nil {
+		return &http.Client{}
+	}
+	if prov != nil {
+		if client := p.providerClients[prov.Name]; client != nil {
+			return client
+		}
+	}
+	if p.client != nil {
+		return p.client
+	}
+	return &http.Client{}
 }
 
 // POST /v1/messages — accept Claude protocol, proxy as OpenAI
@@ -89,10 +181,19 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 	stream := gjson.GetBytes(body, "stream").Bool()
 	log.Printf("[%s] inbound method=%s path=%s model=%s stream=%t body_bytes=%d", reqID, r.Method, r.URL.Path, modelName, stream, len(body))
 	logPayloadSummary(reqID, "claude_request", body)
+	p.logToolDiagnosticsFromClaudeRequest(reqID, r.URL.Path, body)
 
 	route, ok := p.resolve(modelName)
 	if !ok {
 		writeClaudeError(w, http.StatusNotFound, "invalid_request_error", fmt.Sprintf("model %q not found", modelName))
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(route.provider.Type), "codex") {
+		p.handleClaudeViaCodex(reqID, w, r, route, body, stream, startedAt)
+		return
+	}
+	if isKiroProviderType(route.provider.Type) {
+		p.handleClaudeViaKiro(reqID, w, r, route, body, stream, startedAt)
 		return
 	}
 
@@ -101,6 +202,7 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 	openaiReq := claudeRequestToOpenAI(body, route.model, stream)
 	log.Printf("[%s] translated claude->openai provider=%s upstream_model=%s req_bytes=%d took=%s", reqID, route.provider.Name, route.model, len(openaiReq), sinceMS(translateStartedAt))
 	logPayloadSummary(reqID, "openai_request", openaiReq)
+	p.logToolDiagnosticsFromOpenAIRequest(reqID, "claude_to_openai", r.URL.Path, openaiReq)
 
 	upstreamURL := strings.TrimSuffix(route.provider.BaseURL, "/") + "/chat/completions"
 	ctx, cancel := contextWithTimeout(r, defaultUpstreamTimeout)
@@ -114,10 +216,10 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 	p.setProviderHeaders(httpReq, route.provider, r.Header)
 
 	upstreamStartedAt := time.Now()
-	resp, err := p.client.Do(httpReq)
+	resp, err := p.httpClientForProvider(route.provider).Do(httpReq)
 	if err != nil {
 		log.Printf("[%s] upstream_error provider=%s url=%s took=%s err=%v", reqID, route.provider.Name, upstreamURL, sinceMS(upstreamStartedAt), err)
-		writeClaudeError(w, http.StatusBadGateway, "api_error", "upstream: "+err.Error())
+		writeClaudeError(w, http.StatusBadGateway, "api_error", explainUpstreamError(err))
 		return
 	}
 	defer resp.Body.Close()
@@ -136,6 +238,7 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRequestBodySize))
 		log.Printf("[%s] upstream_body_read bytes=%d took=%s", reqID, len(respBody), sinceMS(readStartedAt))
 		logPayloadSummary(reqID, "openai_response", respBody)
+		p.logToolDiagnosticsFromOpenAIResponse(reqID, "claude_nonstream", "/chat/completions", respBody)
 		if resp.StatusCode != http.StatusOK {
 			log.Printf("[%s] nonstream_error status=%d total=%s", reqID, resp.StatusCode, sinceMS(startedAt))
 			writeClaudeError(w, resp.StatusCode, "api_error", string(respBody))
@@ -164,28 +267,27 @@ func (p *Proxy) streamClaudeResponse(reqID string, w http.ResponseWriter, body i
 	flusher.Flush()
 
 	conv := newStreamConverter()
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	toolCallLogs := newStreamedToolCallLogs()
 	lineCount := 0
 	eventCount := 0
 	firstUpstreamDataLogged := false
 	firstDownstreamEventLogged := false
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if !bytes.HasPrefix(line, []byte("data: ")) {
-			continue
-		}
+	err := readSSE(body, func(data []byte) error {
 		lineCount++
-		data := bytes.TrimSpace(line[6:])
 		if len(data) == 0 {
-			continue
+			return nil
 		}
 		if !firstUpstreamDataLogged {
 			firstUpstreamDataLogged = true
 			log.Printf("[%s] claude_stream_first_upstream_data since_upstream=%s since_request=%s", reqID, sinceMS(upstreamStartedAt), sinceMS(requestStartedAt))
 		}
 		logStreamChunkSummary(reqID, "upstream_chunk", data)
+		finishReason := updateStreamedToolCallLogs(toolCallLogs, data)
+		if finishReason != "" {
+			logCompletedStreamedToolCalls(reqID, "upstream_summary", finishReason, toolCallLogs)
+		}
+		p.logToolDiagnosticsFromOpenAIStreamChunk(reqID, "claude_stream", "/chat/completions", data)
 		events := conv.convert(data)
 		if len(events) > 0 {
 			eventCount++
@@ -196,8 +298,9 @@ func (p *Proxy) streamClaudeResponse(reqID string, w http.ResponseWriter, body i
 			w.Write(events)
 			flusher.Flush()
 		}
-	}
-	if err := scanner.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		log.Printf("[%s] claude_stream_scan_error err=%v", reqID, err)
 	}
 
@@ -208,6 +311,7 @@ func (p *Proxy) streamClaudeResponse(reqID string, w http.ResponseWriter, body i
 		w.Write(events)
 		flusher.Flush()
 	}
+	logCompletedStreamedToolCalls(reqID, "upstream_summary", "stream_end", toolCallLogs)
 	log.Printf("[%s] claude_stream_done upstream_lines=%d downstream_writes=%d total=%s", reqID, lineCount, eventCount, sinceMS(requestStartedAt))
 }
 
@@ -246,6 +350,7 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[%s] responses_request_full body=%s", reqID, string(body))
 	logPayloadSummary(reqID, "responses_as_chat_completions", upstreamBody)
 	log.Printf("[%s] responses_as_chat_completions_full body=%s", reqID, string(upstreamBody))
+	p.logToolDiagnosticsFromOpenAIRequest(reqID, "responses_to_chat_completions", r.URL.Path, upstreamBody)
 
 	upstreamURL := strings.TrimSuffix(route.provider.BaseURL, "/") + "/chat/completions"
 	ctx, cancel := contextWithTimeout(r, defaultUpstreamTimeout)
@@ -259,10 +364,10 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 	p.setProviderHeaders(httpReq, route.provider, r.Header)
 
 	upstreamStartedAt := time.Now()
-	resp, err := p.client.Do(httpReq)
+	resp, err := p.httpClientForProvider(route.provider).Do(httpReq)
 	if err != nil {
 		log.Printf("[%s] upstream_error provider=%s url=%s took=%s err=%v", reqID, route.provider.Name, upstreamURL, sinceMS(upstreamStartedAt), err)
-		writeOpenAIError(w, http.StatusBadGateway, "upstream: "+err.Error())
+		writeOpenAIError(w, http.StatusBadGateway, explainUpstreamError(err))
 		return
 	}
 	defer resp.Body.Close()
@@ -277,6 +382,7 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRequestBodySize))
 	log.Printf("[%s] upstream_body_read bytes=%d took=%s", reqID, len(respBody), sinceMS(readStartedAt))
 	logChatCompletionsResponseSummary(reqID, "responses_upstream_response", respBody)
+	p.logToolDiagnosticsFromOpenAIResponse(reqID, "responses_nonstream", "/chat/completions", respBody)
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("[%s] nonstream_error status=%d total=%s summary=%s", reqID, resp.StatusCode, sinceMS(startedAt), summarizeErrorBody(resp.Header.Get("Content-Type"), respBody))
 		writeOpenAIError(w, resp.StatusCode, string(respBody))
@@ -338,9 +444,9 @@ func (p *Proxy) handleResponsesCompact(w http.ResponseWriter, r *http.Request) {
 	}
 	p.setProviderHeaders(httpReq, route.provider, r.Header)
 
-	resp, err := p.client.Do(httpReq)
+	resp, err := p.httpClientForProvider(route.provider).Do(httpReq)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "upstream: "+err.Error())
+		writeOpenAIError(w, http.StatusBadGateway, explainUpstreamError(err))
 		return
 	}
 	defer resp.Body.Close()
@@ -385,29 +491,29 @@ func (p *Proxy) streamResponsesFromChatCompletions(reqID string, w http.Response
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	var state any
+	toolCallLogs := newStreamedToolCallLogs()
 	lineCount := 0
 	eventCount := 0
 	firstUpstreamDataLogged := false
 	firstDownstreamEventLogged := false
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if !bytes.HasPrefix(line, []byte("data:")) {
-			continue
-		}
+	err := readSSE(resp.Body, func(data []byte) error {
 		lineCount++
-		data := bytes.TrimSpace(line[5:])
 		if len(data) == 0 {
-			continue
+			return nil
 		}
 		if !firstUpstreamDataLogged {
 			firstUpstreamDataLogged = true
 			log.Printf("[%s] responses_stream_first_upstream_data since_upstream=%s since_request=%s", reqID, sinceMS(upstreamStartedAt), sinceMS(requestStartedAt))
 		}
 		logStreamChunkSummary(reqID, "responses_upstream_chunk", data)
-		events := convertChatCompletionsStreamToResponses(originalRequest, append([]byte(nil), line...), &state)
+		finishReason := updateStreamedToolCallLogs(toolCallLogs, data)
+		if finishReason != "" {
+			logCompletedStreamedToolCalls(reqID, "responses_upstream_summary", finishReason, toolCallLogs)
+		}
+		p.logToolDiagnosticsFromOpenAIStreamChunk(reqID, "responses_stream", "/chat/completions", data)
+		line := append([]byte("data: "), data...)
+		events := convertChatCompletionsStreamToResponses(originalRequest, line, &state)
 		for _, event := range events {
 			eventCount++
 			if !firstDownstreamEventLogged {
@@ -419,11 +525,13 @@ func (p *Proxy) streamResponsesFromChatCompletions(reqID string, w http.Response
 			_, _ = w.Write([]byte("\n\n"))
 			flusher.Flush()
 		}
-	}
-	if err := scanner.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		log.Printf("[%s] responses_stream_error upstream_lines=%d downstream_writes=%d total=%s err=%v", reqID, lineCount, eventCount, sinceMS(requestStartedAt), err)
 		return
 	}
+	logCompletedStreamedToolCalls(reqID, "responses_upstream_summary", "stream_end", toolCallLogs)
 	log.Printf("[%s] responses_stream_done upstream_lines=%d downstream_writes=%d total=%s", reqID, lineCount, eventCount, sinceMS(requestStartedAt))
 }
 
@@ -449,6 +557,7 @@ func (p *Proxy) handleOpenAIPassthrough(w http.ResponseWriter, r *http.Request, 
 	}
 	log.Printf("[%s] inbound method=%s path=%s model=%s stream=%t body_bytes=%d", reqID, r.Method, r.URL.Path, modelName, stream, len(body))
 	logPayloadSummary(reqID, "openai_passthrough_request "+logLabel, body)
+	p.logToolDiagnosticsFromOpenAIRequest(reqID, "openai_passthrough_"+strings.ReplaceAll(logLabel, "/", "_"), r.URL.Path, body)
 
 	route, ok := p.resolve(modelName)
 	if !ok {
@@ -456,23 +565,34 @@ func (p *Proxy) handleOpenAIPassthrough(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	upstreamBody := rewriteModelInRequest(body, route.model)
+
 	upstreamURL := strings.TrimSuffix(route.provider.BaseURL, "/") + upstreamPath
 	ctx, cancel := contextWithTimeout(r, defaultUpstreamTimeout)
 	defer cancel()
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(body))
-	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "create request failed")
-		return
-	}
-	p.setProviderHeaders(httpReq, route.provider, r.Header)
-
 	upstreamStartedAt := time.Now()
-	resp, err := p.client.Do(httpReq)
-	if err != nil {
-		log.Printf("[%s] upstream_error provider=%s url=%s took=%s err=%v", reqID, route.provider.Name, upstreamURL, sinceMS(upstreamStartedAt), err)
-		writeOpenAIError(w, http.StatusBadGateway, "upstream: "+err.Error())
-		return
+	var resp *http.Response
+	if isOllamaProviderType(route.provider.Type) {
+		resp, err = p.doOllamaRequestWithRetry(ctx, route.provider, r.Header, http.MethodPost, upstreamURL, upstreamBody)
+		if err != nil {
+			log.Printf("[%s] upstream_error provider=%s url=%s took=%s err=%v", reqID, route.provider.Name, upstreamURL, sinceMS(upstreamStartedAt), err)
+			writeOpenAIError(w, http.StatusBadGateway, explainUpstreamError(err))
+			return
+		}
+	} else {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(upstreamBody))
+		if err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "create request failed")
+			return
+		}
+		p.setProviderHeaders(httpReq, route.provider, r.Header)
+		resp, err = p.httpClientForProvider(route.provider).Do(httpReq)
+		if err != nil {
+			log.Printf("[%s] upstream_error provider=%s url=%s took=%s err=%v", reqID, route.provider.Name, upstreamURL, sinceMS(upstreamStartedAt), err)
+			writeOpenAIError(w, http.StatusBadGateway, explainUpstreamError(err))
+			return
+		}
 	}
 	defer resp.Body.Close()
 	log.Printf("[%s] upstream_headers provider=%s status=%d took=%s", reqID, route.provider.Name, resp.StatusCode, sinceMS(upstreamStartedAt))
@@ -507,7 +627,11 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	for _, prov := range p.cfg.Providers {
 		for _, m := range prov.Models {
 			names := []string{m.Name}
+			names = append(names, providerModelAliases(prov, m)...)
 			names = append(names, modelAliases(m)...)
+			for _, alias := range modelAliases(m) {
+				names = append(names, providerAliasVariants(prov, alias)...)
+			}
 			for _, name := range names {
 				if seen[name] {
 					continue
@@ -519,6 +643,29 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 					Created: time.Now().Unix(),
 					OwnedBy: prov.Name,
 				})
+			}
+		}
+		if isOllamaProviderType(prov.Type) && strings.TrimSpace(prov.BaseURL) != "" {
+			ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+			dynamic, err := p.fetchOllamaModels(ctx, prov)
+			cancel()
+			if err != nil {
+				log.Printf("ollama dynamic model list failed provider=%s err=%v", prov.Name, err)
+			} else {
+				for _, name := range dynamic {
+					for _, modelID := range []string{name, ollamaModelPrefix + name} {
+						if seen[modelID] {
+							continue
+						}
+						seen[modelID] = true
+						models = append(models, modelEntry{
+							ID:      modelID,
+							Object:  "model",
+							Created: time.Now().Unix(),
+							OwnedBy: prov.Name,
+						})
+					}
+				}
 			}
 		}
 	}
@@ -540,11 +687,36 @@ func modelAliases(m ModelConfig) []string {
 	return nil
 }
 
+func providerModelAliases(prov ProviderConfig, m ModelConfig) []string {
+	return providerAliasVariants(prov, m.Name)
+}
+
+func providerAliasVariants(prov ProviderConfig, name string) []string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	if isKiroProviderType(prov.Type) {
+		return []string{"kiro/" + name}
+	}
+	if isOllamaProviderType(prov.Type) {
+		return []string{ollamaModelPrefix + name}
+	}
+	return nil
+}
+
 // -- helpers --
 
 func (p *Proxy) setProviderHeaders(req *http.Request, prov *ProviderConfig, inbound http.Header) {
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+prov.APIKey)
+	p.setProviderHeadersWithAPIKey(req, prov, inbound, prov.APIKey)
+}
+
+func (p *Proxy) setProviderHeadersWithAPIKey(req *http.Request, prov *ProviderConfig, inbound http.Header, apiKey string) {
+	req.Header.Set("Content-Type", "application/json")
+	if strings.TrimSpace(apiKey) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(apiKey))
+	}
 	for _, key := range passthroughRequestHeaders {
 		for _, value := range inbound.Values(key) {
 			req.Header.Add(key, value)
@@ -601,12 +773,76 @@ func copyStreamResponse(reqID string, w http.ResponseWriter, body io.Reader, req
 	}
 }
 
+func explainUpstreamError(err error) string {
+	if err == nil {
+		return "upstream: unknown error"
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "proxyconnect tcp") {
+		hint := "upstream proxy connection failed; check HTTPS_PROXY/https_proxy/ALL_PROXY and NO_PROXY settings"
+		if strings.Contains(msg, "lookup http ") || strings.Contains(msg, "lookup http:") {
+			hint += " (the proxy URL may be malformed, for example a duplicated `http://` prefix)"
+		}
+		return fmt.Sprintf("%s; original error: %s", hint, msg)
+	}
+	return "upstream: " + msg
+}
+
 func nextRequestID(prefix string) string {
 	return fmt.Sprintf("%s-%06d", prefix, atomic.AddUint64(&requestSeq, 1))
 }
 
 func sinceMS(startedAt time.Time) string {
 	return time.Since(startedAt).Round(time.Millisecond).String()
+}
+
+func newStreamedToolCallLogs() map[int]*streamedToolCallLog {
+	return make(map[int]*streamedToolCallLog)
+}
+
+func updateStreamedToolCallLogs(state map[int]*streamedToolCallLog, data []byte) string {
+	root := gjson.ParseBytes(data)
+	if tcs := root.Get("choices.0.delta.tool_calls"); tcs.Exists() && tcs.IsArray() {
+		tcs.ForEach(func(_, tc gjson.Result) bool {
+			idx := int(tc.Get("index").Int())
+			entry, ok := state[idx]
+			if !ok {
+				entry = &streamedToolCallLog{}
+				state[idx] = entry
+			}
+			if id := strings.TrimSpace(tc.Get("id").String()); id != "" {
+				entry.ID = id
+			}
+			if name := strings.TrimSpace(tc.Get("function.name").String()); name != "" {
+				entry.Name = name
+			}
+			if args := tc.Get("function.arguments").String(); args != "" {
+				entry.Args.WriteString(args)
+				entry.Chunks++
+			}
+			return true
+		})
+	}
+	return strings.TrimSpace(root.Get("choices.0.finish_reason").String())
+}
+
+func logCompletedStreamedToolCalls(reqID, label, finishReason string, state map[int]*streamedToolCallLog) {
+	for idx, entry := range state {
+		if entry == nil || entry.Logged {
+			continue
+		}
+		log.Printf("[%s] %s tool_call_complete index=%d id=%s name=%s arg_chunks=%d finish_reason=%s args=%s",
+			reqID,
+			label,
+			idx,
+			trimForLog(entry.ID),
+			entry.Name,
+			entry.Chunks,
+			finishReason,
+			trimForLog(entry.Args.String()),
+		)
+		entry.Logged = true
+	}
 }
 
 func logPayloadSummary(reqID, label string, body []byte) {
@@ -758,6 +994,61 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func rewriteModelInRequest(body []byte, model string) []byte {
+	if model == "" {
+		return body
+	}
+	if !gjson.ValidBytes(body) {
+		return body
+	}
+	rewritten, err := sjson.SetBytes(body, "model", model)
+	if err != nil {
+		return body
+	}
+	return rewritten
+}
+
+func readSSE(r io.Reader, onData func([]byte) error) error {
+	reader := bufio.NewReaderSize(r, 64*1024)
+	var dataLines [][]byte
+
+	flush := func() error {
+		if len(dataLines) == 0 {
+			return nil
+		}
+		payload := bytes.Join(dataLines, []byte("\n"))
+		dataLines = dataLines[:0]
+		return onData(bytes.TrimSpace(payload))
+	}
+
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+
+		line = bytes.TrimRight(line, "\r\n")
+		if len(line) == 0 {
+			if err2 := flush(); err2 != nil {
+				return err2
+			}
+		} else if bytes.HasPrefix(line, []byte("data:")) {
+			data := line[len("data:"):]
+			if len(data) > 0 && data[0] == ' ' {
+				data = data[1:]
+			}
+			dataLines = append(dataLines, append([]byte(nil), data...))
+		}
+
+		if errors.Is(err, io.EOF) {
+			if err2 := flush(); err2 != nil {
+				return err2
+			}
+			return nil
+		}
+	}
 }
 
 func writeClaudeError(w http.ResponseWriter, status int, errType, msg string) {
