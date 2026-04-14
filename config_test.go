@@ -179,6 +179,41 @@ providers:
 	}
 }
 
+func TestLoadConfigModelPlainStringContentOverride(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yaml")
+	content := `
+server:
+  port: 8080
+providers:
+  - name: modelarts
+    type: openai-compatible
+    base-url: https://api.modelarts-maas.com/v2
+    plain-string-content: true
+    models:
+      - name: glm-5
+      - name: qwen2.5-vl-72b
+        alias: glm-5-vl
+        plain-string-content: false
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	if !cfg.Providers[0].PlainStringContent {
+		t.Fatalf("expected provider plain-string-content default")
+	}
+	model := cfg.Providers[0].Models[1]
+	if model.PlainStringContent == nil || *model.PlainStringContent {
+		t.Fatalf("expected model plain-string-content override false, got %#v", model.PlainStringContent)
+	}
+}
+
 func TestLoadConfigFileNotFound(t *testing.T) {
 	_, err := LoadConfig("/nonexistent/config.yaml")
 	if err == nil {

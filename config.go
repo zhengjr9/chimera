@@ -23,19 +23,20 @@ type ServerConfig struct {
 }
 
 type ProviderConfig struct {
-	Name      string            `yaml:"name"`
-	Type      string            `yaml:"type"`
-	BaseURL   string            `yaml:"base-url"`
-	APIKey    string            `yaml:"api-key"`
-	APIKeys   []string          `yaml:"api-keys"`
-	Proxy     string            `yaml:"proxy"`
-	CAFile    string            `yaml:"ca-file"`
-	Insecure  bool              `yaml:"insecure-skip-verify"`
-	Headers   map[string]string `yaml:"headers"`
-	AuthDir   string            `yaml:"auth-dir"`
-	Models    []ModelConfig     `yaml:"models"`
-	MaxTokens int               `yaml:"max-tokens"`
-	UseAPIKey bool              `yaml:"use-api-key"`
+	Name               string            `yaml:"name"`
+	Type               string            `yaml:"type"`
+	BaseURL            string            `yaml:"base-url"`
+	APIKey             string            `yaml:"api-key"`
+	APIKeys            []string          `yaml:"api-keys"`
+	Proxy              string            `yaml:"proxy"`
+	CAFile             string            `yaml:"ca-file"`
+	Insecure           bool              `yaml:"insecure-skip-verify"`
+	Headers            map[string]string `yaml:"headers"`
+	AuthDir            string            `yaml:"auth-dir"`
+	Models             []ModelConfig     `yaml:"models"`
+	MaxTokens          int               `yaml:"max-tokens"`
+	UseAPIKey          bool              `yaml:"use-api-key"`
+	PlainStringContent bool              `yaml:"plain-string-content"`
 }
 
 type CodexConfig struct {
@@ -47,15 +48,17 @@ type KiroConfig struct {
 }
 
 type ModelConfig struct {
-	Name    string   `yaml:"name"`
-	Alias   string   `yaml:"-"`
-	Aliases []string `yaml:"-"`
+	Name               string   `yaml:"name"`
+	Alias              string   `yaml:"-"`
+	Aliases            []string `yaml:"-"`
+	PlainStringContent *bool    `yaml:"plain-string-content"`
 }
 
 func (m *ModelConfig) UnmarshalYAML(value *yaml.Node) error {
 	type rawModelConfig struct {
-		Name  string    `yaml:"name"`
-		Alias yaml.Node `yaml:"alias"`
+		Name               string    `yaml:"name"`
+		Alias              yaml.Node `yaml:"alias"`
+		PlainStringContent *bool     `yaml:"plain-string-content"`
 	}
 
 	var raw rawModelConfig
@@ -64,6 +67,7 @@ func (m *ModelConfig) UnmarshalYAML(value *yaml.Node) error {
 	}
 
 	m.Name = raw.Name
+	m.PlainStringContent = raw.PlainStringContent
 	if raw.Alias.Kind == 0 {
 		return nil
 	}

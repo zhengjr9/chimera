@@ -309,6 +309,9 @@ func TestClaudeRequestToOpenAIWithTools(t *testing.T) {
 	if tools[0].Get("function.parameters.additionalProperties").Exists() && tools[0].Get("function.parameters.additionalProperties").Bool() {
 		t.Fatalf("expected additionalProperties false, got %s", tools[0].Get("function.parameters").Raw)
 	}
+	if !tools[0].Get(`function.parameters.required.#(=="location")`).Exists() {
+		t.Fatalf("expected location in required, got %s", tools[0].Get("function.parameters").Raw)
+	}
 }
 
 func TestClaudeRequestToOpenAIFiltersInvalidToolsAndResults(t *testing.T) {

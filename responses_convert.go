@@ -19,7 +19,8 @@ const (
 	defaultUpstreamTimeout = 5 * time.Minute
 )
 
-func convertResponsesRequestToChatCompletions(modelName string, inputRawJSON []byte, stream bool) []byte {
+func convertResponsesRequestToChatCompletions(modelName string, inputRawJSON []byte, stream bool, plainStringContent ...bool) []byte {
+	forcePlain := len(plainStringContent) > 0 && plainStringContent[0]
 	root := gjson.ParseBytes(inputRawJSON)
 	out := `{"model":"","messages":[],"stream":false}`
 
@@ -45,6 +46,19 @@ func convertResponsesRequestToChatCompletions(modelName string, inputRawJSON []b
 	}
 
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
+		pendingToolCallIDs := make(map[string]bool)
+		pendingFunctionCalls := make([]string, 0)
+		flushFunctionCalls := func() {
+			if len(pendingFunctionCalls) == 0 {
+				return
+			}
+			message := `{"role":"assistant","tool_calls":[]}`
+			for i, toolCall := range pendingFunctionCalls {
+				message, _ = sjson.SetRaw(message, fmt.Sprintf("tool_calls.%d", i), toolCall)
+			}
+			out, _ = sjson.SetRaw(out, "messages.-1", message)
+			pendingFunctionCalls = pendingFunctionCalls[:0]
+		}
 		input.ForEach(func(_, item gjson.Result) bool {
 			itemType := item.Get("type").String()
 			if itemType == "" && item.Get("role").String() != "" {
@@ -53,6 +67,7 @@ func convertResponsesRequestToChatCompletions(modelName string, inputRawJSON []b
 
 			switch itemType {
 			case "message", "":
+				flushFunctionCalls()
 				role := item.Get("role").String()
 				if role == "developer" {
 					role = "user"
@@ -62,32 +77,49 @@ func convertResponsesRequestToChatCompletions(modelName string, inputRawJSON []b
 
 				content := item.Get("content")
 				if content.Exists() && content.IsArray() {
+					var contentParts []string
 					content.ForEach(func(_, contentItem gjson.Result) bool {
 						contentType := contentItem.Get("type").String()
 						if contentType == "" {
 							contentType = "input_text"
 						}
 						switch contentType {
-						case "input_text", "output_text":
+						case "input_text", "output_text", "text":
 							part := `{"type":"text","text":""}`
 							part, _ = sjson.Set(part, "text", contentItem.Get("text").String())
-							message, _ = sjson.SetRaw(message, "content.-1", part)
-						case "input_image":
+							if forcePlain {
+								contentParts = append(contentParts, part)
+							} else {
+								message, _ = sjson.SetRaw(message, "content.-1", part)
+							}
+						case "input_image", "image_url":
 							part := `{"type":"image_url","image_url":{"url":""}}`
-							part, _ = sjson.Set(part, "image_url.url", contentItem.Get("image_url").String())
-							message, _ = sjson.SetRaw(message, "content.-1", part)
+							imageURL := contentItem.Get("image_url").String()
+							if imageURL == "" {
+								imageURL = contentItem.Get("image_url.url").String()
+							}
+							part, _ = sjson.Set(part, "image_url.url", imageURL)
+							if forcePlain {
+								contentParts = append(contentParts, part)
+							} else {
+								message, _ = sjson.SetRaw(message, "content.-1", part)
+							}
 						}
 						return true
 					})
+					if forcePlain && !applyMessageContentPlain(&message, contentParts) {
+						message, _ = sjson.Set(message, "content", "")
+					}
 				} else if content.Type == gjson.String {
 					message, _ = sjson.Set(message, "content", content.String())
 				}
 
 				out, _ = sjson.SetRaw(out, "messages.-1", message)
+				clear(pendingToolCallIDs)
 
 			case "function_call":
-				message := `{"role":"assistant","tool_calls":[]}`
 				toolCall := `{"id":"","type":"function","function":{"name":"","arguments":""}}`
+				callID := item.Get("call_id").String()
 				if v := item.Get("call_id"); v.Exists() {
 					toolCall, _ = sjson.Set(toolCall, "id", v.String())
 				}
@@ -97,13 +129,19 @@ func convertResponsesRequestToChatCompletions(modelName string, inputRawJSON []b
 				if v := item.Get("arguments"); v.Exists() {
 					toolCall, _ = sjson.Set(toolCall, "function.arguments", sanitizeFunctionArguments(v.String()))
 				}
-				message, _ = sjson.SetRaw(message, "tool_calls.0", toolCall)
-				out, _ = sjson.SetRaw(out, "messages.-1", message)
+				pendingFunctionCalls = append(pendingFunctionCalls, toolCall)
+				if callID != "" {
+					pendingToolCallIDs[callID] = true
+				}
 
 			case "function_call_output":
-				message := `{"role":"tool","tool_call_id":"","content":""}`
-				if v := item.Get("call_id"); v.Exists() {
-					message, _ = sjson.Set(message, "tool_call_id", v.String())
+				flushFunctionCalls()
+				callID := item.Get("call_id").String()
+				message := `{"role":"user","content":""}`
+				if pendingToolCallIDs[callID] {
+					message = `{"role":"tool","tool_call_id":"","content":""}`
+					message, _ = sjson.Set(message, "tool_call_id", callID)
+					delete(pendingToolCallIDs, callID)
 				}
 				if v := item.Get("output"); v.Exists() {
 					message, _ = sjson.Set(message, "content", v.String())
@@ -112,6 +150,7 @@ func convertResponsesRequestToChatCompletions(modelName string, inputRawJSON []b
 			}
 			return true
 		})
+		flushFunctionCalls()
 	} else if input.Type == gjson.String {
 		msg := `{"role":"user","content":""}`
 		msg, _ = sjson.Set(msg, "content", input.String())
@@ -161,7 +200,47 @@ func convertResponsesRequestToChatCompletions(modelName string, inputRawJSON []b
 		}
 	}
 
+	out = sanitizeChatToolMessages(out)
 	return []byte(out)
+}
+
+func sanitizeChatToolMessages(raw string) string {
+	root := gjson.Parse(raw)
+	messages := root.Get("messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return raw
+	}
+
+	var activeToolCalls map[string]bool
+	sanitized := "[]"
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		next := msg.Raw
+		role := msg.Get("role").String()
+		if role == "assistant" {
+			activeToolCalls = make(map[string]bool)
+			msg.Get("tool_calls").ForEach(func(_, toolCall gjson.Result) bool {
+				if id := toolCall.Get("id").String(); id != "" {
+					activeToolCalls[id] = true
+				}
+				return true
+			})
+		} else if role == "tool" {
+			toolCallID := msg.Get("tool_call_id").String()
+			if toolCallID == "" || !activeToolCalls[toolCallID] {
+				next, _ = sjson.Set(next, "role", "user")
+				next, _ = sjson.Delete(next, "tool_call_id")
+				activeToolCalls = nil
+			} else {
+				delete(activeToolCalls, toolCallID)
+			}
+		} else {
+			activeToolCalls = nil
+		}
+		sanitized, _ = sjson.SetRaw(sanitized, "-1", next)
+		return true
+	})
+	raw, _ = sjson.SetRaw(raw, "messages", sanitized)
+	return raw
 }
 
 func sanitizeFunctionArguments(raw string) string {

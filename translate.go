@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -15,7 +16,8 @@ import (
 // Request translation: Claude -> OpenAI
 // ---------------------------------------------------------------------------
 
-func claudeRequestToOpenAI(raw []byte, model string, stream bool) []byte {
+func claudeRequestToOpenAI(raw []byte, model string, stream bool, plainStringContent ...bool) []byte {
+	forcePlain := len(plainStringContent) > 0 && plainStringContent[0]
 	root := gjson.ParseBytes(raw)
 	out, _ := sjson.Set("{}", "model", model)
 	out, _ = sjson.Set(out, "stream", stream)
@@ -65,7 +67,11 @@ func claudeRequestToOpenAI(raw []byte, model string, stream bool) []byte {
 				return true
 			})
 		}
-		if applyMessageContent(&sysMsg, systemParts) {
+		applyFn := applyMessageContent
+		if forcePlain {
+			applyFn = applyMessageContentPlain
+		}
+		if applyFn(&sysMsg, systemParts) {
 			msgsStr, _ = sjson.SetRaw(msgsStr, "-1", sysMsg)
 		}
 	}
@@ -136,7 +142,13 @@ func claudeRequestToOpenAI(raw []byte, model string, stream bool) []byte {
 
 				if role == "assistant" && (hasText || hasReason || hasTC) {
 					m := `{"role":"assistant"}`
-					if !applyMessageContent(&m, textParts) {
+					applied := false
+					if forcePlain {
+						applied = applyMessageContentPlain(&m, textParts)
+					} else {
+						applied = applyMessageContent(&m, textParts)
+					}
+					if !applied {
 						m, _ = sjson.Set(m, "content", "")
 					}
 					if hasReason {
@@ -148,7 +160,11 @@ func claudeRequestToOpenAI(raw []byte, model string, stream bool) []byte {
 					msgsStr, _ = sjson.SetRaw(msgsStr, "-1", m)
 				} else if hasText {
 					m := fmt.Sprintf(`{"role":%q,"content":[]}`, role)
-					applyMessageContent(&m, textParts)
+					if forcePlain {
+						applyMessageContentPlain(&m, textParts)
+					} else {
+						applyMessageContent(&m, textParts)
+					}
 					msgsStr, _ = sjson.SetRaw(msgsStr, "-1", m)
 				}
 			} else if content.Exists() && content.Type == gjson.String {
@@ -630,6 +646,27 @@ func applyMessageContent(msg *string, parts []string) bool {
 	return true
 }
 
+// applyMessageContentPlain forces content to a plain string, joining all text
+// parts and dropping non-text parts (e.g. images). Used for providers like
+// ModelArts that do not accept the OpenAI multipart content array format.
+func applyMessageContentPlain(msg *string, parts []string) bool {
+	if len(parts) == 0 {
+		return false
+	}
+	var texts []string
+	for _, part := range parts {
+		parsed := gjson.Parse(part)
+		if t := parsed.Get("text"); t.Exists() && t.Type == gjson.String {
+			texts = append(texts, t.String())
+		}
+	}
+	if len(texts) == 0 {
+		return false
+	}
+	*msg, _ = sjson.Set(*msg, "content", strings.Join(texts, "\n\n"))
+	return true
+}
+
 func joinTextParts(parts []string) (string, bool) {
 	texts := make([]string, 0, len(parts))
 	for _, part := range parts {
@@ -985,22 +1022,26 @@ func normalizeSchemaObject(schema string) string {
 
 	switch gjson.Get(schema, "type").String() {
 	case "object":
-		if !gjson.Get(schema, "properties").Exists() {
+		props := gjson.Get(schema, "properties")
+		if !props.Exists() || !props.IsObject() {
 			schema, _ = sjson.SetRaw(schema, "properties", `{}`)
+			props = gjson.Get(schema, "properties")
 		}
 		if !gjson.Get(schema, "additionalProperties").Exists() {
 			schema, _ = sjson.Set(schema, "additionalProperties", false)
 		}
-		props := gjson.Get(schema, "properties")
-		if props.Exists() && props.IsObject() {
-			props.ForEach(func(key, value gjson.Result) bool {
-				if value.IsObject() {
-					nested := normalizeSchemaObject(value.Raw)
-					schema, _ = sjson.SetRaw(schema, "properties."+key.String(), nested)
-				}
-				return true
-			})
-		}
+		required := make([]string, 0)
+		props.ForEach(func(key, value gjson.Result) bool {
+			name := key.String()
+			required = append(required, name)
+			if value.IsObject() {
+				nested := normalizeSchemaObject(value.Raw)
+				schema, _ = sjson.SetRaw(schema, "properties."+name, nested)
+			}
+			return true
+		})
+		sort.Strings(required)
+		schema, _ = sjson.Set(schema, "required", required)
 	case "array":
 		items := gjson.Get(schema, "items")
 		if items.Exists() && items.IsObject() {

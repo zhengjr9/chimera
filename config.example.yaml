@@ -22,6 +22,11 @@ providers:
         alias: "model-alias"  # 模型别名
       - name: "another-model-name"
         alias: ["model-alias-a", "model-alias-b"]  # 多个模型别名
+      # 对不支持 OpenAI multipart content 的模型可设为 true；
+      # 视觉模型需要设为 false，才能转发 image_url 图片。
+      - name: "vision-model-name"
+        alias: "vision-model-alias"
+        plain-string-content: false
 
   - name: "codex-oauth"
     type: "codex"

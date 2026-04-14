@@ -37,8 +37,9 @@ var passthroughRequestHeaders = []string{
 }
 
 type routeEntry struct {
-	provider *ProviderConfig
-	model    string
+	provider           *ProviderConfig
+	model              string
+	plainStringContent bool
 }
 
 type Proxy struct {
@@ -111,14 +112,15 @@ func NewProxy(cfg *Config) *Proxy {
 		}
 		log.Printf("provider client configured provider=%s proxy=%s tls=%s", prov.Name, describeProxyMode(prov.Proxy), describeTLSMode(prov.CAFile, prov.Insecure))
 		for _, m := range prov.Models {
-			p.routes[m.Name] = routeEntry{provider: prov, model: m.Name}
+			route := routeEntry{provider: prov, model: m.Name, plainStringContent: modelPlainStringContent(*prov, m)}
+			p.routes[m.Name] = route
 			for _, extra := range providerModelAliases(*prov, m) {
-				p.routes[extra] = routeEntry{provider: prov, model: m.Name}
+				p.routes[extra] = route
 			}
 			for _, alias := range modelAliases(m) {
-				p.routes[alias] = routeEntry{provider: prov, model: m.Name}
+				p.routes[alias] = route
 				for _, extra := range providerAliasVariants(*prov, alias) {
-					p.routes[extra] = routeEntry{provider: prov, model: m.Name}
+					p.routes[extra] = route
 				}
 			}
 		}
@@ -199,7 +201,7 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	// Translate Claude -> OpenAI
 	translateStartedAt := time.Now()
-	openaiReq := claudeRequestToOpenAI(body, route.model, stream)
+	openaiReq := claudeRequestToOpenAI(body, route.model, stream, route.plainStringContent)
 	log.Printf("[%s] translated claude->openai provider=%s upstream_model=%s req_bytes=%d took=%s", reqID, route.provider.Name, route.model, len(openaiReq), sinceMS(translateStartedAt))
 	logPayloadSummary(reqID, "openai_request", openaiReq)
 	p.logToolDiagnosticsFromOpenAIRequest(reqID, "claude_to_openai", r.URL.Path, openaiReq)
@@ -345,7 +347,7 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstreamBody := convertResponsesRequestToChatCompletions(route.model, body, stream)
+	upstreamBody := convertResponsesRequestToChatCompletions(route.model, body, stream, route.plainStringContent)
 	logPayloadSummary(reqID, "responses_request", body)
 	log.Printf("[%s] responses_request_full body=%s", reqID, string(body))
 	logPayloadSummary(reqID, "responses_as_chat_completions", upstreamBody)
@@ -427,7 +429,7 @@ func (p *Proxy) handleResponsesCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstreamBody := convertResponsesRequestToChatCompletions(route.model, body, false)
+	upstreamBody := convertResponsesRequestToChatCompletions(route.model, body, false, route.plainStringContent)
 	logPayloadSummary(reqID, "responses_compact_request", body)
 	log.Printf("[%s] responses_compact_request_full body=%s", reqID, string(body))
 	logPayloadSummary(reqID, "responses_compact_as_chat_completions", upstreamBody)
@@ -689,6 +691,13 @@ func modelAliases(m ModelConfig) []string {
 
 func providerModelAliases(prov ProviderConfig, m ModelConfig) []string {
 	return providerAliasVariants(prov, m.Name)
+}
+
+func modelPlainStringContent(prov ProviderConfig, m ModelConfig) bool {
+	if m.PlainStringContent != nil {
+		return *m.PlainStringContent
+	}
+	return prov.PlainStringContent
 }
 
 func providerAliasVariants(prov ProviderConfig, name string) []string {
